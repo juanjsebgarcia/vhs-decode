@@ -4,7 +4,7 @@
 
 from dataclasses import dataclass
 from fractions import Fraction
-from math import exp, log10, pi, sqrt, ceil, floor, atan2, cos, sin, lcm
+from math import exp, log10, pi, sqrt, ceil, floor, atan2, cos, sin, lcm, gcd
 from typing import Tuple
 from time import perf_counter
 from setproctitle import setproctitle
@@ -1370,6 +1370,19 @@ class HiFiDecode:
             block_audio_overlap_divisor = int(
                 self._initial_block_audio_size / block_size_gcd
             )
+
+            # smallest number of final rate samples that is also a whole number of
+            # input rate and audio rate samples
+            exact_overlap_divisor = lcm(
+                self.audio_final_rate // gcd(self.audio_final_rate, self.input_rate),
+                self.audio_final_rate // gcd(self.audio_final_rate, self.audio_rate),
+            )
+            if block_audio_overlap_divisor % exact_overlap_divisor != 0:
+                # The divisor above divides a 192 kHz block size by a gcd of input and final
+                # rate block sizes. At 44.1 kHz it gives 1920 samples (43.5 ms per side, so ~21%
+                # of every block is decoded twice), which is still not a whole number of input
+                # samples. Use the smallest exact unit instead (441 samples, 10 ms at 44.1 kHz).
+                block_audio_overlap_divisor = exact_overlap_divisor
         else:
             print(
                 f"WARNING: The input sample rate is not evenly divisible by the output sample rate. Audio sync issues may occur. Input Rate: {self.input_rate}, Output Rate: {self.audio_final_rate}."
