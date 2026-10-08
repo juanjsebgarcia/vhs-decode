@@ -194,3 +194,10 @@ DEMOD_HILBERT_IF_RATE = 2**23
 DEMOD_QUADRATURE = "quadrature"
 DEMOD_HILBERT = "hilbert"
 DEFAULT_DEMOD = DEMOD_QUADRATURE
+
+# carrier bandpass (AFE) implementation
+#   iir: 22nd order cheby2 run forwards and backwards (sosfiltfilt) in the time domain
+#   fft: the same zero-phase |H|^2 response applied in the frequency domain, sharing one FFT between L and R
+CARRIER_FILTER_IIR = "iir"
+CARRIER_FILTER_FFT = "fft"
+DEFAULT_CARRIER_FILTER = CARRIER_FILTER_IIR
