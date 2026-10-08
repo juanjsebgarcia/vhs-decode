@@ -233,11 +233,14 @@ class BurstInfo:
 
 
 @njit(nogil=True, inline='always')
-def _solve_4x4(A, b):
+def _solve_4x4(A, b, M, x):
     """
     Inlined 4x4 Gaussian elimination solver with partial pivoting.
+
+    M is a (4, 5) work buffer and x receives the solution, both supplied by
+    the caller so no allocation happens per solve.
+    Returns False if the matrix is singular (x is then left undefined).
     """
-    M = np.empty((4, 5))
     for r in range(4):
         M[r, 0] = A[r, 0]
         M[r, 1] = A[r, 1]
@@ -263,7 +266,7 @@ def _solve_4x4(A, b):
                 M[max_row, c] = tmp
                 
         if abs(M[i, i]) < 1e-12:
-            return np.zeros(4), False  # Singular matrix protection
+            return False  # Singular matrix protection
             
         # Eliminate below
         for r in range(i + 1, 4):
@@ -272,14 +275,13 @@ def _solve_4x4(A, b):
                 M[r, c] -= factor * M[i, c]
                 
     # Back substitution
-    x = np.empty(4)
     for i in range(3, -1, -1):
         sum_ax = 0.0
         for j in range(i + 1, 4):
             sum_ax += M[i, j] * x[j]
         x[i] = (M[i, 4] - sum_ax) / M[i, i]
-        
-    return x, True
+
+    return True
 
 
 @njit(nogil=True, fastmath=False, cache=True, inline='always')
@@ -315,11 +317,8 @@ def _tune_burst_measurements(
     for k in range(N):
         t[k] = (k + burst_start) / (4.0 * fsc)
 
-    theta = np.empty(N, dtype=np.float64)
-    cos_theta = np.empty(N, dtype=np.float64)
-    sin_theta = np.empty(N, dtype=np.float64)
     r = np.empty(N, dtype=np.float64)
-    
+
     # Pre-allocate Jacobian components
     j0 = np.empty(N, dtype=np.float64)
     j1 = np.empty(N, dtype=np.float64)
@@ -330,42 +329,64 @@ def _tune_burst_measurements(
     J_JT = np.empty((4, 4), dtype=np.float64)
     J_r = np.empty(4, dtype=np.float64)
 
+    # Pre-allocate solver work buffers
+    solve_M = np.empty((4, 5), dtype=np.float64)
+    delta = np.empty(4, dtype=np.float64)
+
     minus_two_pi = -2.0 * np.pi
+
+    # Loop invariant: d(theta)/df
+    minus_two_pi_t = np.empty(N, dtype=np.float64)
+    for k in range(N):
+        minus_two_pi_t[k] = minus_two_pi * t[k]
 
     for _ in range(max_iter):
         two_pi_f = 2.0 * np.pi * f
 
-        theta = (two_pi_f * t) - phi
-        cos_theta = np.cos(theta)
-        sin_theta = np.sin(theta)
-        
-        # Compute residual vector
-        r = burst - (A * cos_theta + dc)
-        
-        # Build Jacobian components
-        j0 = cos_theta
-        j1 = A * sin_theta
-        j3 = (minus_two_pi * t) * j1
+        # Compute the model, residual vector and Jacobian components in one pass.
+        # The sums are accumulated sequentially from index 0, the same order as np.sum.
+        sum_j0 = 0.0
+        sum_j1 = 0.0
+        sum_j3 = 0.0
+        sum_r = 0.0
+        for k in range(N):
+            theta_k = (two_pi_f * t[k]) - phi
+            cos_k = math.cos(theta_k)
+            sin_k = math.sin(theta_k)
+
+            r_k = burst[k] - (A * cos_k + dc)
+            j1_k = A * sin_k
+            j3_k = minus_two_pi_t[k] * j1_k
+
+            j0[k] = cos_k
+            j1[k] = j1_k
+            j3[k] = j3_k
+            r[k] = r_k
+
+            sum_j0 += cos_k
+            sum_j1 += j1_k
+            sum_j3 += j3_k
+            sum_r += r_k
 
         # np.dot utilizes BLAS-like instruction sets (SSE, AVX, or AVX-512)
         J_JT[0, 0] = np.dot(j0, j0)
         J_JT[0, 1] = np.dot(j0, j1)
-        J_JT[0, 2] = np.sum(j0)          # since j2 is 1.0
+        J_JT[0, 2] = sum_j0              # since j2 is 1.0
         J_JT[0, 3] = np.dot(j0, j3)
-        
+
         J_JT[1, 1] = np.dot(j1, j1)
-        J_JT[1, 2] = np.sum(j1)          # since j2 is 1.0
+        J_JT[1, 2] = sum_j1              # since j2 is 1.0
         J_JT[1, 3] = np.dot(j1, j3)
-        
+
         J_JT[2, 2] = float(N)            # np.dot(1.0, 1.0) for N elements
-        J_JT[2, 3] = np.sum(j3)          # since j2 is 1.0
-        
+        J_JT[2, 3] = sum_j3              # since j2 is 1.0
+
         J_JT[3, 3] = np.dot(j3, j3)
-        
+
         # Compute J_r vector elements using SIMD-accelerated dot products
         J_r[0] = np.dot(j0, r)
         J_r[1] = np.dot(j1, r)
-        J_r[2] = np.sum(r)               # since j2 is 1.0
+        J_r[2] = sum_r                   # since j2 is 1.0
         J_r[3] = np.dot(j3, r)
 
         # Mirror the upper triangle to the lower triangle (Exploit Symmetry)
@@ -387,7 +408,7 @@ def _tune_burst_measurements(
         J_JT[3, 3] += 1e-6
 
         # Solve system
-        delta, success = _solve_4x4(J_JT, J_r)
+        success = _solve_4x4(J_JT, J_r, solve_M, delta)
         if not success:
             break
 
