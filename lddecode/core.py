@@ -35,7 +35,7 @@ from .utils import LRUupdate, clb_findbursts, angular_mean_helper, phase_distanc
 from .utils import build_hilbert, unwrap_hilbert, emphasis_iir, filtfft
 from .utils import fft_do_slice, fft_determine_slices, StridedCollector, hz_to_output_array
 from .utils import Pulse, nb_std, n_ornotrange, gen_bpf_supergauss, FieldInfo
-from .utils import concatenate_blocks
+from .utils import concatenate_blocks, same_block_layout
 
 try:
     # If Anaconda's numpy is installed, mkl will use all threads for fft etc
@@ -1676,7 +1676,7 @@ class DemodCache:
             assembled = {}
             for k, arrays in t.items():
                 if len(arrays) == len(blocknums) and all(
-                    a.dtype == arrays[0].dtype for a in arrays
+                    same_block_layout(a, arrays[0]) for a in arrays
                 ):
                     bounds = np.cumsum([0] + [len(a) for a in arrays])
                     assembled[k] = (arrays, concatenate_blocks(arrays), bounds)
