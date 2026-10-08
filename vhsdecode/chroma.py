@@ -478,44 +478,106 @@ def _demod_burst(
 
     return burst_center, burst_phase_deg, burst_amplitude, burst_magnitude, burst_dc, burst_frequency, I, Q
 
-def _get_upconverted_burst(
+
+@njit(cache=True, nogil=True, fastmath=False)
+def _demod_bursts(
+    bursts,
+    burst_starts,
+    burst_lens,
+    burst_sin,
+    burst_cos,
+    fsc
+):
+    """
+    Runs _demod_burst on each row of bursts (row i holds burst_lens[i] valid samples).
+    Returns an (n, 8) array holding the _demod_burst results for each row.
+    """
+    count = len(burst_lens)
+    results = np.empty((count, 8), dtype=np.float64)
+    for i in range(count):
+        burst_len = burst_lens[i]
+        burst_results = _demod_burst(
+            bursts[i, :burst_len], burst_starts[i], burst_len, burst_sin, burst_cos, fsc
+        )
+        for j in range(8):
+            results[i, j] = burst_results[j]
+
+    return results
+
+
+# Number of lines measured per batched _demod_bursts call in _get_phase_sequence
+BURST_BATCH_LINES = 32
+
+
+def _get_upconverted_bursts(
     chroma,
     chroma_heterodyne,
     chroma_filter,
-    current_phase,
+    start_phase,
+    phase_step,
     burst_area,
     burst_sin,
     burst_cos,
-    line_number,
+    first_line,
+    line_count,
     line_offset,
     outwidth,
     fsc
 ):
+    """
+    Up-converts, filters and measures the color burst of line_count consecutive lines
+    starting at first_line. The heterodyne phase starts at start_phase and advances by
+    phase_step every line. The burst fitting for all lines is done in a single numba call.
+    Returns a list of (phase, BurstInfo).
+    """
     burst_filter_padding = burst_area[0]
-    line_start = (line_number - line_offset) * outwidth
-    burst_start = max(0, line_start + burst_area[0] - burst_filter_padding)
-    burst_end = min(len(chroma), line_start + burst_area[1] + burst_filter_padding)
 
-    upconverted_burst = (
-        chroma_heterodyne[current_phase][burst_start:burst_end]
-        * chroma[burst_start:burst_end]
+    phases = []
+    burst_bounds = []
+    filtered_bursts = []
+    phase = start_phase
+    for line_number in range(first_line, first_line + line_count):
+        line_start = (line_number - line_offset) * outwidth
+        burst_start = max(0, line_start + burst_area[0] - burst_filter_padding)
+        burst_end = min(len(chroma), line_start + burst_area[1] + burst_filter_padding)
+
+        upconverted_burst = (
+            chroma_heterodyne[phase][burst_start:burst_end]
+            * chroma[burst_start:burst_end]
+        )
+
+        # filter out noise so only the color burst is present
+        filtered_padded = sosfiltfilt_rust(chroma_filter, upconverted_burst)
+        filtered_bursts.append(filtered_padded[burst_filter_padding:-burst_filter_padding])
+
+        phases.append(phase)
+        burst_bounds.append((burst_start, burst_end))
+        phase = (phase + phase_step) % 4
+
+    burst_lens = np.array([len(filtered) for filtered in filtered_bursts], dtype=np.int64)
+    # keep the filter output dtype, the burst measurement arithmetic depends on it
+    bursts = np.zeros((line_count, burst_lens.max()), dtype=filtered_bursts[0].dtype)
+    for i, filtered in enumerate(filtered_bursts):
+        bursts[i, :len(filtered)] = filtered
+
+    burst_starts = np.array(
+        [burst_start + burst_filter_padding for burst_start, _ in burst_bounds], dtype=np.int64
     )
+    results = _demod_bursts(bursts, burst_starts, burst_lens, burst_sin, burst_cos, fsc).tolist()
 
-    # filter out noise so only the color burst is present
-    filtered_padded = sosfiltfilt_rust(chroma_filter, upconverted_burst)
-    filtered = filtered_padded[burst_filter_padding:-burst_filter_padding]
+    return [
+        (
+            phases[i],
+            BurstInfo(
+                first_line + i,
+                burst_bounds[i][0],
+                burst_bounds[i][1],
+                *results[i]
+            )
+        )
+        for i in range(line_count)
+    ]
 
-    burst_len = len(filtered)
-    burst_results = _demod_burst(
-        filtered, burst_start + burst_filter_padding, burst_len, burst_sin, burst_cos, fsc
-    )
-
-    return BurstInfo(
-        line_number,
-        burst_start,
-        burst_end,
-        *burst_results
-    )
 
 def _get_phase_sequence(
     chroma,
@@ -573,6 +635,37 @@ def _get_phase_sequence(
           Possibly a 2D aware detection could be used to determine where the color phase is rotated +-90 degrees relative to the lines above and below
     """
 
+    # The bursts are measured ahead in batches, assuming the phase keeps advancing by the
+    # current track rotation. Each burst only depends on its line and heterodyne phase, so a
+    # cached burst is reused only if it was measured with the phase requested for that line.
+    burst_cache = {}
+
+    def get_burst(line_number, phase, phase_step):
+        cached = burst_cache.get(line_number)
+        if cached is not None and cached[0] == phase:
+            return cached[1]
+
+        line_count = min(BURST_BATCH_LINES, last_line - line_number)
+        bursts = _get_upconverted_bursts(
+            chroma,
+            chroma_heterodyne,
+            chroma_filter,
+            phase,
+            phase_step,
+            burstarea,
+            burst_sin,
+            burst_cos,
+            line_number,
+            line_count,
+            lineoffset,
+            outwidth,
+            fsc
+        )
+        for i, burst in enumerate(bursts):
+            burst_cache[line_number + i] = burst
+
+        return bursts[0][1]
+
     current_phase = 0
     use_next_phase = False
     for linenumber in range(lineoffset, last_line):
@@ -584,19 +677,7 @@ def _get_phase_sequence(
             use_next_phase = False
         else:
             current_phase = (current_phase + track_rotation) % 4
-            current_burst = _get_upconverted_burst(
-                chroma,
-                chroma_heterodyne,
-                chroma_filter,
-                current_phase,
-                burstarea,
-                burst_sin,
-                burst_cos,
-                linenumber,
-                lineoffset,
-                outwidth,
-                fsc
-            )
+            current_burst = get_burst(linenumber, current_phase, track_rotation)
 
         # check if the track has rotated around the head switching area
         if (
@@ -606,19 +687,7 @@ def _get_phase_sequence(
         ):
             # get the next burst using the phase rotation for the current track
             next_phase = (current_phase + track_rotation) % 4
-            next_burst = _get_upconverted_burst(
-                chroma,
-                chroma_heterodyne,
-                chroma_filter,
-                next_phase,
-                burstarea,
-                burst_sin,
-                burst_cos,
-                linenumber + 1,
-                lineoffset,
-                outwidth,
-                fsc
-            )
+            next_burst = get_burst(linenumber + 1, next_phase, track_rotation)
 
             if color_system == "NTSC":
                 # check one line back
