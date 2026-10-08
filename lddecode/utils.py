@@ -525,6 +525,18 @@ def load_packed_data_4_40(infile, sample, readlen):
     return unpack_data_4_40(indata, readlen, offset)
 
 
+def _join_loader_thread(thread, timeout):
+    """Join a loader's daemon worker thread, unless the interpreter is shutting
+    down: a loader still open at exit is closed from __del__, and joining a
+    thread during finalization raises."""
+    if thread is None or thread is threading.current_thread() or sys.is_finalizing():
+        return
+    try:
+        thread.join(timeout=timeout)
+    except RuntimeError:
+        pass
+
+
 class LoadFFmpeg:
     """Load samples from a wide variety of formats using ffmpeg.
 
@@ -573,7 +585,7 @@ class LoadFFmpeg:
                 self.ffmpeg.stdout.close()
             self.ffmpeg = None
         if self.feeder is not None:
-            self.feeder.join(timeout=5)
+            _join_loader_thread(self.feeder, timeout=5)
             self.feeder = None
         self.feeder_stop = None
 
@@ -914,7 +926,7 @@ class LoadLDF:
             with self._cv:
                 # Wake the reader if it is parked on backpressure.
                 self._cv.notify_all()
-            self._reader_thread.join(timeout=2)
+            _join_loader_thread(self._reader_thread, timeout=2)
 
         if self._container is not None:
             try:
