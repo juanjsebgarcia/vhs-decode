@@ -5,6 +5,7 @@ import itertools
 import json
 import math
 import os
+import socket
 import subprocess
 import sys
 import traceback
@@ -532,8 +533,9 @@ class LoadFFmpeg:
         self.input_args = input_args
         self.output_args = output_args
 
-        # ffmpeg subprocess
+        # ffmpeg subprocess, and the file its output is read from
         self.ffmpeg = None
+        self.ffmpeg_output = None
 
         # The number of the next byte ffmpeg will return
         self.position = 0
@@ -544,10 +546,62 @@ class LoadFFmpeg:
         self.rewind_size = 16 * 1024 * 1024
         self.rewind_buf = bytearray()
 
+    # ffmpeg can only run ahead of the decoder by as much as its output
+    # channel buffers. A pipe holds just 64 KB (and can't be enlarged on
+    # macOS), so reads kept stalling while ffmpeg produced the next block. A
+    # Unix socket pair can buffer several MB, letting ffmpeg decode/resample
+    # ahead in parallel without needing an extra thread in this process.
+    output_buffer_size = 8 * 1024 * 1024
+
+    # Read whatever ffmpeg has produced in large chunks, so most block reads
+    # are served from memory. Every read syscall releases the GIL, and on the
+    # busy decode thread getting it back can take far longer than the read.
+    read_buffer_size = 4 * 1024 * 1024
+
+    def _start_ffmpeg(self, command, infile):
+        if os.name != "posix":
+            self.ffmpeg = subprocess.Popen(
+                command, stdin=infile, stdout=subprocess.PIPE
+            )
+            self.ffmpeg_output = self.ffmpeg.stdout
+            return
+
+        read_sock, write_sock = socket.socketpair()
+        try:
+            for sock, option in (
+                (write_sock, socket.SO_SNDBUF),
+                (read_sock, socket.SO_RCVBUF),
+            ):
+                # Ask for the largest buffer the OS allows, up to output_buffer_size.
+                size = self.output_buffer_size
+                while size > 65536:
+                    try:
+                        sock.setsockopt(socket.SOL_SOCKET, option, size)
+                        break
+                    except OSError:
+                        size //= 2
+
+            self.ffmpeg = subprocess.Popen(
+                command, stdin=infile, stdout=write_sock.fileno()
+            )
+        except BaseException:
+            read_sock.close()
+            raise
+        finally:
+            # Only ffmpeg may hold the write end, so we see EOF when it exits.
+            write_sock.close()
+
+        self.ffmpeg_output = os.fdopen(
+            read_sock.detach(), "rb", buffering=self.read_buffer_size
+        )
+
     def _close(self):
         if self.ffmpeg is not None:
             self.ffmpeg.kill()
             self.ffmpeg.wait()
+        if self.ffmpeg_output is not None:
+            self.ffmpeg_output.close()
+            self.ffmpeg_output = None
 
     def __del__(self):
         self._close()
@@ -556,7 +610,7 @@ class LoadFFmpeg:
         """Read data as bytes from ffmpeg, append it to the rewind buffer, and
         return it. May return less than count bytes if EOF is reached."""
 
-        data = self.ffmpeg.stdout.read(count)
+        data = self.ffmpeg_output.read(count)
         self.position += len(data)
 
         self.rewind_buf += data
@@ -575,9 +629,7 @@ class LoadFFmpeg:
             command += ["-i", "-"]
             command += self.output_args
             command += ["-c:a", "pcm_s16le", "-f", "s16le", "-"]
-            self.ffmpeg = subprocess.Popen(
-                command, stdin=infile, stdout=subprocess.PIPE
-            )
+            self._start_ffmpeg(command, infile)
 
         if sample_bytes < self.position:
             # Seeking backwards - use data from rewind_buf
