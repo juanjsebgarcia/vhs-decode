@@ -1490,13 +1490,16 @@ class VHSRFDecode(ldd.RFDecode):
             out_video = demod
 
         # demod_burst is a bit misleading, but keeping the naming for compatability.
-        # Kept as separate contiguous arrays rather than a packed record array
-        # (same values and dtypes), see DemodColumns.
+        # Kept as separate contiguous arrays rather than a packed record array,
+        # see DemodColumns.
+        # demod_burst is only ever read through Field.downscale, which converts
+        # it to float32 first, so it is stored as float32 here (same values,
+        # converting before joining the blocks gives the same result).
         video_out = lddu.DemodColumns(
             {
                 "demod": out_video,
                 "demod_05": out_video05,
-                "demod_burst": out_chroma,
+                "demod_burst": out_chroma.astype(np.float32),
                 "envelope": env,
             }
         )
