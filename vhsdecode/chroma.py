@@ -977,11 +977,15 @@ def decode_chroma_phase_rotation(
     # Video8 PAL:   Track1 0,   Track2 -90
     # Video8 NTSC:  Track1 0,   Track2 180
 
-    chroma_heterodyne = (
-        field.rf.chroma_afc.getChromaHet()
-        if (field.rf.do_cafc and not disable_tracking_cafc)
-        else field.rf.chroma_heterodyne
-    )
+    if field.rf.do_cafc and not disable_tracking_cafc:
+        # This runs on the field decode thread; use the heterodyne snapshot
+        # taken before the decode started rather than the live AFC state,
+        # which the main thread may be updating concurrently.
+        chroma_heterodyne = field.rf.cafc_burst_heterodyne
+        if chroma_heterodyne is None:
+            chroma_heterodyne = field.rf.chroma_afc.getChromaHet()
+    else:
+        chroma_heterodyne = field.rf.chroma_heterodyne
 
     prev_burst_detected_line = 0
     if field.prevfield is not None:
