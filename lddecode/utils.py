@@ -526,7 +526,12 @@ def load_packed_data_4_40(infile, sample, readlen):
 
 
 class LoadFFmpeg:
-    """Load samples from a wide variety of formats using ffmpeg."""
+    """Load samples from a wide variety of formats using ffmpeg.
+
+    For a native FLAC file decoded without resampling, ffmpeg can be started
+    at the frame containing the requested sample (see lddecode.flacseek),
+    instead of decoding and discarding everything before it.  The samples
+    returned are identical either way."""
 
     def __init__(self, input_args=[], output_args=[]):
         self.input_args = input_args
@@ -544,13 +549,99 @@ class LoadFFmpeg:
         self.rewind_size = 16 * 1024 * 1024
         self.rewind_buf = bytearray()
 
+        # Forward jumps farther than this (in output bytes) restart ffmpeg at
+        # the right FLAC frame instead of reading and discarding, when the
+        # input supports it.
+        self.seek_threshold = 40 * 1024 * 1024
+
+        # FLAC frame locator for the input (None: seeking not possible),
+        # looked up on the first read.
+        self.locator = None
+        self.locator_checked = False
+
+        # Thread feeding ffmpeg's stdin when it was started mid-file.
+        self.feeder = None
+        self.feeder_stop = None
+
     def _close(self):
+        if self.feeder_stop is not None:
+            self.feeder_stop.set()
         if self.ffmpeg is not None:
             self.ffmpeg.kill()
             self.ffmpeg.wait()
+            if self.ffmpeg.stdout is not None:
+                self.ffmpeg.stdout.close()
+            self.ffmpeg = None
+        if self.feeder is not None:
+            self.feeder.join(timeout=5)
+            self.feeder = None
+        self.feeder_stop = None
 
     def __del__(self):
         self._close()
+
+    def _get_locator(self, infile):
+        """FLAC frame locator for infile, if seeking can be exact."""
+        if not self.locator_checked:
+            self.locator_checked = True
+            # Only without format overrides or filters: the resampler is
+            # stateful, so output started mid-file would not match a full run.
+            if not self.input_args and not self.output_args:
+                from lddecode import flacseek
+
+                try:
+                    fd = infile.fileno()
+                except (AttributeError, OSError, ValueError):
+                    fd = None
+                if fd is not None:
+                    name = getattr(infile, "name", None)
+                    self.locator = flacseek.open_locator(
+                        fd, name if isinstance(name, str) else None
+                    )
+                    if self.locator is not None and not self.locator.stream.pcm_seekable():
+                        self.locator = None
+        return self.locator
+
+    def _start_at_frame(self, infile, sample):
+        """(Re)start ffmpeg at the FLAC frame containing `sample`.
+
+        Returns False, leaving the current state alone, if that is not
+        possible."""
+        locator = self._get_locator(infile)
+        if locator is None:
+            return False
+        from lddecode import flacseek
+
+        try:
+            frame = locator.locate(sample)
+        except OSError as e:
+            flacseek.logger.warning("FLAC seek failed (%s); reading from the start instead", e)
+            frame = None
+        if frame is None:
+            return False
+
+        self._close()
+        command = ["ffmpeg", "-hide_banner", "-loglevel", "quiet"]
+        command += ["-f", "flac", "-i", "-"]
+        command += ["-c:a", "pcm_s16le", "-f", "s16le", "-"]
+        self.ffmpeg = subprocess.Popen(
+            command, stdin=subprocess.PIPE, stdout=subprocess.PIPE
+        )
+        self.feeder_stop = threading.Event()
+        self.feeder = threading.Thread(
+            target=flacseek.feed_pipe,
+            args=(
+                flacseek.FramesFromOffset(locator.stream, frame.offset),
+                self.ffmpeg.stdin,
+                self.feeder_stop,
+            ),
+            daemon=True,
+        )
+        self.feeder.start()
+
+        self.position = frame.first_sample * 2
+        self.rewind_buf = bytearray()
+        return True
 
     def _read_data(self, count):
         """Read data as bytes from ffmpeg, append it to the rewind buffer, and
@@ -570,14 +661,22 @@ class LoadFFmpeg:
         readlen_bytes = readlen * 2
 
         if self.ffmpeg is None:
-            command = ["ffmpeg", "-hide_banner", "-loglevel", "quiet"]
-            command += self.input_args
-            command += ["-i", "-"]
-            command += self.output_args
-            command += ["-c:a", "pcm_s16le", "-f", "s16le", "-"]
-            self.ffmpeg = subprocess.Popen(
-                command, stdin=infile, stdout=subprocess.PIPE
-            )
+            if sample == 0 or not self._start_at_frame(infile, sample):
+                command = ["ffmpeg", "-hide_banner", "-loglevel", "quiet"]
+                command += self.input_args
+                command += ["-i", "-"]
+                command += self.output_args
+                command += ["-c:a", "pcm_s16le", "-f", "s16le", "-"]
+                self.ffmpeg = subprocess.Popen(
+                    command, stdin=infile, stdout=subprocess.PIPE
+                )
+        elif (
+            sample_bytes - self.position > self.seek_threshold
+            or self.position - sample_bytes > len(self.rewind_buf)
+        ):
+            # Far forward, or further back than the rewind buffer reaches:
+            # restart at the right frame if possible.
+            self._start_at_frame(infile, sample)
 
         if sample_bytes < self.position:
             # Seeking backwards - use data from rewind_buf
@@ -636,7 +735,7 @@ class LoadLDF:
         self.rewind_buf = bytearray()
 
         # Forward seeks farther than this (in bytes) restart the decoder with a
-        # container seek instead of reading and discarding samples one by one.
+        # seek instead of reading and discarding samples one by one.
         self.seek_threshold = 40 * 1024 * 1024
 
         # Soft cap on the decode buffer, to bound memory use.  The reader thread
@@ -655,30 +754,86 @@ class LoadLDF:
         self._reader_thread = None
         self._stop_event = None
 
+        # Frame locator for native FLAC inputs (see lddecode.flacseek)
+        self._locator = None
+        self._locator_fd = None
+        self._locator_checked = False
+
+    def _get_locator(self):
+        """FLAC frame locator for a native FLAC input (None otherwise)."""
+        if not self._locator_checked:
+            self._locator_checked = True
+            from lddecode import flacseek
+
+            try:
+                self._locator_fd = os.open(self.filename, os.O_RDONLY)
+            except OSError:
+                self._locator_fd = None
+            if self._locator_fd is not None:
+                locator = flacseek.open_locator(self._locator_fd, self.filename)
+                if locator is not None and locator.stream.pcm_seekable():
+                    self._locator = locator
+        return self._locator
+
+    def _sample_of_pts(self, pts):
+        """Sample index of a pts in the stream's time base."""
+        return round(pts * self._stream.time_base * self._stream.sample_rate)
+
     def _start_decoder(self, sample):
         """Start/reset the decoder so the next sample returned is `sample`."""
         import av
+        from lddecode import flacseek
 
         self._stop_decoder()
 
-        self._container = av.open(self.filename)
-        self._stream = self._container.streams.audio[0]
+        # Each RF sample is stored as one audio sample (the container's sample
+        # rate is only a label, e.g. 40k for 40 MHz), so sample indexes and
+        # stream sample positions are the same thing.
+        base_sample = 0
+        first_frame = None
+        frame = None
+        if sample > 0 and self._get_locator() is not None:
+            try:
+                frame = self._locator.locate(sample)
+            except OSError as e:
+                flacseek.logger.warning("FLAC seek failed (%s); using container seek", e)
+
+        if frame is not None:
+            # Native FLAC: decode from the frame containing `sample`.
+            self._container = av.open(
+                flacseek.FramesFromOffset(self._locator.stream, frame.offset),
+                format="flac",
+            )
+            self._stream = self._container.streams.audio[0]
+            self._decode_iter = self._container.decode(self._stream)
+            base_sample = frame.first_sample
+        else:
+            self._container = av.open(self.filename)
+            self._stream = self._container.streams.audio[0]
+            if sample > 0:
+                # Seek to a frame at or before `sample`, in the stream's time
+                # base, then trust only the pts of the first decoded frame.
+                target_pts = int(
+                    sample / (self._stream.time_base * self._stream.sample_rate)
+                )
+                self._container.seek(
+                    target_pts, stream=self._stream, backward=True, any_frame=False
+                )
+                self._decode_iter = self._container.decode(self._stream)
+                first_frame = next(self._decode_iter, None)
+                if first_frame is not None and first_frame.pts is not None:
+                    base_sample = self._sample_of_pts(first_frame.pts)
+                if first_frame is None or first_frame.pts is None or base_sample > sample:
+                    # Position unknown: decode from the start instead.
+                    self._container.close()
+                    self._container = av.open(self.filename)
+                    self._stream = self._container.streams.audio[0]
+                    first_frame = None
+                    base_sample = 0
+            if first_frame is None:
+                self._decode_iter = self._container.decode(self._stream)
+
         self._resampler = av.audio.resampler.AudioResampler(format="s16", layout="mono")
-
-        if sample > 0:
-            # Seek a little before the target; the reader thread discards the
-            # lead-in so the buffer starts exactly at `sample`.
-            # The container sample_rate is stored at 40k (an audio-friendly
-            # rate), while the actual RF data is 40 MHz -- 1000x difference.
-            # Convert RF sample offset to stream time_base units:
-            #   1 RF sample = 1/40_000_000 sec
-            #   1 stream unit = 1/40_000 sec
-            #   -> 1 RF sample = 1/1000 stream units
-            seek_offset = sample // 1000
-            seek_offset = max(0, seek_offset - self._stream.sample_rate)
-            self._container.seek(seek_offset, any_frame=True)
-
-        self._decode_iter = self._container.decode(audio=0)
 
         # Capture the buffer and stop flag per run so a reader thread left over
         # from a previous decoder can never touch the current buffer.
@@ -693,38 +848,28 @@ class LoadLDF:
         self.position = sample * 2
         self.rewind_buf = bytearray()
 
+        frames = self._decode_iter
+        if first_frame is not None:
+            frames = itertools.chain([first_frame], frames)
+
         self._reader_thread = threading.Thread(
             target=self._reader_loop,
-            args=(stop_event, buf, sample),
+            args=(stop_event, buf, frames, sample - base_sample),
             daemon=True,
         )
         self._reader_thread.start()
 
-    def _reader_loop(self, stop_event, buf, target_sample):
+    def _reader_loop(self, stop_event, buf, frames, skip_samples):
         """Background thread: decode FLAC frames into `buf`.
 
-        Discards any samples decoded before `target_sample` (the lead-in that
-        results from seeking to a frame before the requested position)."""
+        Discards the first `skip_samples` decoded samples (the lead-in from
+        the frame decoding started at to the requested position)."""
         try:
-            skip_samples = None
-            for frame in self._decode_iter:
+            for frame in frames:
                 if stop_event.is_set():
                     return
                 if frame is None:
                     continue
-
-                if skip_samples is None:
-                    # The first decoded frame tells us where decoding actually
-                    # resumed after the seek, via its presentation timestamp.
-                    # Scale by 1000: container stores 40k rate, RF data is 40 MHz.
-                    if frame.pts is not None:
-                        base_sample = round(
-                            float(frame.pts * self._stream.time_base)
-                            * self._stream.sample_rate * 1000
-                        )
-                    else:
-                        base_sample = target_sample
-                    skip_samples = max(0, target_sample - base_sample)
 
                 for rf in self._resampler.resample(frame):
                     if stop_event.is_set():
@@ -807,6 +952,11 @@ class LoadLDF:
 
     def _close(self):
         self._stop_decoder()
+        if self._locator_fd is not None:
+            os.close(self._locator_fd)
+            self._locator_fd = None
+            self._locator = None
+            self._locator_checked = False
 
     def __del__(self):
         self._close()
