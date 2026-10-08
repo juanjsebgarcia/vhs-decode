@@ -1417,6 +1417,59 @@ def LRUupdate(l, k):
     l.insert(0, k)
 
 
+class ArrayPool:
+    """Recycles large field-sized arrays instead of allocating fresh ones per field.
+
+    Each fresh multi-MB allocation is handed out by the kernel as new (zeroed) pages,
+    which costs page faults and memory bandwidth on every field. An array handed out by
+    take() is recycled once nothing references it any more (every numpy view of it holds
+    a reference to it, so the reference count tells when it is free again).
+    Arrays are returned uninitialised, like np.empty.
+    """
+
+    def __init__(self, max_arrays=32, min_bytes=1 << 20):
+        self.max_arrays = max_arrays
+        self.min_bytes = min_bytes
+        self.lock = threading.Lock()
+        self.arrays = []
+        # Held exactly like the pooled arrays, never handed out: its reference count
+        # is what a pooled array's count is when nothing else uses it.
+        self.probe = [np.empty(0)]
+
+    def take(self, n, dtype):
+        dtype = np.dtype(dtype)
+        if n * dtype.itemsize < self.min_bytes:
+            return np.empty(n, dtype=dtype)
+
+        with self.lock:
+            a = self.probe[0]
+            unreferenced = sys.getrefcount(a)
+            best = None
+            unused = None
+            for i in range(len(self.arrays)):
+                a = self.arrays[i]
+                if sys.getrefcount(a) == unreferenced:
+                    if a.dtype == dtype and len(a) >= n:
+                        if best is None or len(a) < len(self.arrays[best]):
+                            best = i
+                    elif unused is None:
+                        unused = i
+            a = None
+            if best is not None:
+                return self.arrays[best][:n]
+
+            # Leave some headroom so slightly longer requests can reuse it later
+            a = np.empty(n + (n >> 4), dtype=dtype)
+            if len(self.arrays) < self.max_arrays:
+                self.arrays.append(a)
+            elif unused is not None:
+                self.arrays[unused] = a
+            return a[:n]
+
+
+array_pool = ArrayPool()
+
+
 class DemodColumns:
     """Demodulator output channels kept as separate contiguous arrays.
 
@@ -1462,9 +1515,13 @@ def same_block_layout(a, b):
 def concatenate_blocks(blocks):
     """Concatenate demodulator cache blocks, being sensitive to performance"""
     if isinstance(blocks[0], DemodColumns):
-        return DemodColumns(
-            {k: np.concatenate([b[k] for b in blocks]) for k in blocks[0].names}
-        )
+        n = sum(len(b) for b in blocks)
+        columns = {}
+        for k in blocks[0].names:
+            out = array_pool.take(n, blocks[0][k].dtype)
+            np.concatenate([b[k] for b in blocks], out=out)
+            columns[k] = out
+        return DemodColumns(columns)
 
     dtype = blocks[0].dtype
     if dtype.names is None:

@@ -35,7 +35,7 @@ from .utils import LRUupdate, clb_findbursts, angular_mean_helper, phase_distanc
 from .utils import build_hilbert, unwrap_hilbert, emphasis_iir, filtfft
 from .utils import fft_do_slice, fft_determine_slices, StridedCollector, hz_to_output_array
 from .utils import Pulse, nb_std, n_ornotrange, gen_bpf_supergauss, FieldInfo
-from .utils import concatenate_blocks, same_block_layout
+from .utils import concatenate_blocks, same_block_layout, array_pool
 
 try:
     # If Anaconda's numpy is installed, mkl will use all threads for fft etc
@@ -1734,6 +1734,26 @@ class DemodCache:
         self.apply_newparams(params)
 
 
+_scaled_output_locs_cache = {}
+
+
+def scaled_output_locs(count, outscale):
+    """np.arange(count) * outscale, computed once per (count, outscale).
+
+    The same array is needed (twice) for every field, it only depends on the
+    line lengths. Returned read-only since it is shared.
+    """
+    key = (count, outscale)
+    locs = _scaled_output_locs_cache.get(key)
+    if locs is None:
+        locs = np.arange(count) * outscale
+        locs.setflags(write=False)
+        if len(_scaled_output_locs_cache) > 16:
+            _scaled_output_locs_cache.clear()
+        _scaled_output_locs_cache[key] = locs
+    return locs
+
+
 @njit(cache=True, nogil=True)
 def _downscale_audio_compute_locs_and_swow(
     lineinfo, line_period, linelen, linecount, timeoffset, freq, scale
@@ -2963,7 +2983,7 @@ class Field:
         spl = interpolate.make_interp_spline(expected_linelocs, actual_linelocs, k=k, bc_type=bc_type, check_finite=False)
 
         # scale up to compute where the output pixel would fall on the interpolated line loc
-        scaled_pixel_locs = np.arange(outsamples + outline_offset) * outscale
+        scaled_pixel_locs = scaled_output_locs(outsamples + outline_offset, outscale)
 
         return spl, scaled_pixel_locs
 
@@ -2981,6 +3001,16 @@ class Field:
         self.level_adjusts_cache = (wowfactors, outwidth, level_adjusts)
         return level_adjusts
 
+    def channel_as_float32(self, channel):
+        """self.data["video"][channel].astype(np.float32, copy=False), but a
+        conversion copy goes into a recycled buffer"""
+        data = self.data["video"][channel]
+        if data.dtype == np.float32:
+            return data
+        out = array_pool.take(len(data), np.float32)
+        np.copyto(out, data, casting="unsafe")
+        return out
+
     def downscale_line_spans(self, channel, span_start, span_end):
         """Same output as downscale(channel=channel) (video only, no audio), but only
         the samples in [span_start, span_end) of each output line are computed.
@@ -2989,7 +3019,8 @@ class Field:
         outwidth = self.outlinelen
         span_start = max(span_start, 0)
         span_end = min(span_end, outwidth)
-        dsout = np.zeros((self.outlinecount * outwidth), dtype=np.float32)
+        dsout = array_pool.take(self.outlinecount * outwidth, np.float32)
+        dsout.fill(0)
 
         spl, scaled_pixel_locs = self.wow_spline(np.array(self.linelocs, dtype=np.float64))
         # the level adjusts need the wow factors of the whole field
@@ -3005,11 +3036,12 @@ class Field:
             np.arange(self.outlinecount)[:, None] * outwidth
             + np.arange(span_start, span_end)[None, :]
         ).ravel() + (self.lineoffset + 1) * outwidth
-        interpolated_pixel_locs = np.zeros_like(scaled_pixel_locs)
+        interpolated_pixel_locs = array_pool.take(len(scaled_pixel_locs), scaled_pixel_locs.dtype)
+        interpolated_pixel_locs.fill(0)
         interpolated_pixel_locs[needed] = spl(scaled_pixel_locs[needed])
 
         scale_field_spans(
-            self.data["video"][channel].astype(np.float32, copy=False),
+            self.channel_as_float32(channel),
             dsout,
             interpolated_pixel_locs,
             level_adjusts,
@@ -3089,10 +3121,11 @@ class Field:
                 # return values will still be in audio_rv later
                 downscale_audio(*dsa_args)
 
-        dsout = np.zeros((linesout * outwidth), dtype=np.float32)
+        dsout = array_pool.take(linesout * outwidth, np.float32)
+        dsout.fill(0)
         interpolated_pixel_locs, wowfactors = self.computewow_scaled()
         scale_field_spans(
-            self.data["video"][channel].astype(np.float32, copy=False),
+            self.channel_as_float32(channel),
             dsout,
             interpolated_pixel_locs,
             self.get_level_adjusts(wowfactors, outwidth),
