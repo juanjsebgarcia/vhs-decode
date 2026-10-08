@@ -464,9 +464,14 @@ class VHSDecode(ldd.LDdecode):
                 self.second_decode = time.time()
 
             if redo:
-                # Drop existing thread
+                # Drop the speculative decode of the next field, but wait for it
+                # first: it reads the same (non-reentrant) DemodCache and shared
+                # decoder state as the re-decode below (cf. ld-decode #815).
+                if self.decodethread and self.decodethread.ident:
+                    self.decodethread.join()
                 self.decodethread = None
 
+                self.rf.snapshot_cafc_burst_heterodyne()
                 f, offset = self.decodefield(
                     redo, self.mtf_level, self.fieldstack[0], initphase, redo
                 )
@@ -504,6 +509,9 @@ class VHSDecode(ldd.LDdecode):
                 False,
                 self.threadreturn,
             )
+
+            # Must happen before f.downscale() below updates the chroma AFC.
+            self.rf.snapshot_cafc_burst_heterodyne()
 
             # decode the next field in a thread so the result is ready for the next iteration
             if self.numthreads != 0:
@@ -937,6 +945,11 @@ class VHSRFDecode(ldd.RFDecode):
             self.chroma_heterodyne = self._chroma_afc.getChromaHet()
             self.fsc_wave, self.fsc_cos_wave = self._chroma_afc.getFSCWaves()
 
+        # Chroma AFC heterodyne used for burst detection while decoding a field.
+        # Set by VHSDecode.readfield() before each field decode starts, see
+        # snapshot_cafc_burst_heterodyne(). None means use the live AFC state.
+        self.cafc_burst_heterodyne = None
+
         if self._chroma_afc.carrier_mult is not None:
             # SECAM method 1: post-TBC band-pass around the under carriers
             # ahead of the x4 phase multiplication.
@@ -1003,6 +1016,20 @@ class VHSRFDecode(ldd.RFDecode):
     @property
     def do_cafc(self):
         return self._do_cafc
+
+    def snapshot_cafc_burst_heterodyne(self):
+        """Fix the chroma AFC heterodyne the next field decode uses for burst detection.
+
+        The next field is decoded on a separate thread while the main thread
+        downscales the current one, and that downscale updates the chroma AFC
+        (ChromaAFC.freqOffset regenerates the heterodyne). Reading the live
+        heterodyne from the decode thread therefore depended on which thread
+        got there first. Taking the snapshot before starting the decode always
+        gives the heterodyne from before the current field's AFC update, which
+        is also what the unthreaded decode order gives.
+        """
+        if self._do_cafc:
+            self.cafc_burst_heterodyne = self._chroma_afc.getChromaHet()
 
     @property
     def color_system(self):
