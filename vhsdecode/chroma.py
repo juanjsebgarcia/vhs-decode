@@ -261,11 +261,14 @@ class BurstArrays:
 
 
 @njit(nogil=True, inline='always')
-def _solve_4x4(A, b):
+def _solve_4x4(A, b, M, x):
     """
     Inlined 4x4 Gaussian elimination solver with partial pivoting.
+
+    M is a (4, 5) work buffer and x receives the solution, both supplied by
+    the caller so no allocation happens per solve.
+    Returns False if the matrix is singular (x is then left undefined).
     """
-    M = np.empty((4, 5))
     for r in range(4):
         M[r, 0] = A[r, 0]
         M[r, 1] = A[r, 1]
@@ -291,7 +294,7 @@ def _solve_4x4(A, b):
                 M[max_row, c] = tmp
                 
         if abs(M[i, i]) < 1e-12:
-            return np.zeros(4), False  # Singular matrix protection
+            return False  # Singular matrix protection
             
         # Eliminate below
         for r in range(i + 1, 4):
@@ -300,14 +303,13 @@ def _solve_4x4(A, b):
                 M[r, c] -= factor * M[i, c]
                 
     # Back substitution
-    x = np.empty(4)
     for i in range(3, -1, -1):
         sum_ax = 0.0
         for j in range(i + 1, 4):
             sum_ax += M[i, j] * x[j]
         x[i] = (M[i, 4] - sum_ax) / M[i, i]
-        
-    return x, True
+
+    return True
 
 
 @njit(nogil=True, fastmath=False, cache=True, inline='always')
@@ -343,11 +345,8 @@ def _tune_burst_measurements(
     for k in range(N):
         t[k] = (k + burst_start) / (4.0 * fsc)
 
-    theta = np.empty(N, dtype=np.float64)
-    cos_theta = np.empty(N, dtype=np.float64)
-    sin_theta = np.empty(N, dtype=np.float64)
     r = np.empty(N, dtype=np.float64)
-    
+
     # Pre-allocate Jacobian components
     j0 = np.empty(N, dtype=np.float64)
     j1 = np.empty(N, dtype=np.float64)
@@ -358,42 +357,64 @@ def _tune_burst_measurements(
     J_JT = np.empty((4, 4), dtype=np.float64)
     J_r = np.empty(4, dtype=np.float64)
 
+    # Pre-allocate solver work buffers
+    solve_M = np.empty((4, 5), dtype=np.float64)
+    delta = np.empty(4, dtype=np.float64)
+
     minus_two_pi = -2.0 * np.pi
+
+    # Loop invariant: d(theta)/df
+    minus_two_pi_t = np.empty(N, dtype=np.float64)
+    for k in range(N):
+        minus_two_pi_t[k] = minus_two_pi * t[k]
 
     for _ in range(max_iter):
         two_pi_f = 2.0 * np.pi * f
 
-        theta = (two_pi_f * t) - phi
-        cos_theta = np.cos(theta)
-        sin_theta = np.sin(theta)
-        
-        # Compute residual vector
-        r = burst - (A * cos_theta + dc)
-        
-        # Build Jacobian components
-        j0 = cos_theta
-        j1 = A * sin_theta
-        j3 = (minus_two_pi * t) * j1
+        # Compute the model, residual vector and Jacobian components in one pass.
+        # The sums are accumulated sequentially from index 0, the same order as np.sum.
+        sum_j0 = 0.0
+        sum_j1 = 0.0
+        sum_j3 = 0.0
+        sum_r = 0.0
+        for k in range(N):
+            theta_k = (two_pi_f * t[k]) - phi
+            cos_k = math.cos(theta_k)
+            sin_k = math.sin(theta_k)
+
+            r_k = burst[k] - (A * cos_k + dc)
+            j1_k = A * sin_k
+            j3_k = minus_two_pi_t[k] * j1_k
+
+            j0[k] = cos_k
+            j1[k] = j1_k
+            j3[k] = j3_k
+            r[k] = r_k
+
+            sum_j0 += cos_k
+            sum_j1 += j1_k
+            sum_j3 += j3_k
+            sum_r += r_k
 
         # np.dot utilizes BLAS-like instruction sets (SSE, AVX, or AVX-512)
         J_JT[0, 0] = np.dot(j0, j0)
         J_JT[0, 1] = np.dot(j0, j1)
-        J_JT[0, 2] = np.sum(j0)          # since j2 is 1.0
+        J_JT[0, 2] = sum_j0              # since j2 is 1.0
         J_JT[0, 3] = np.dot(j0, j3)
-        
+
         J_JT[1, 1] = np.dot(j1, j1)
-        J_JT[1, 2] = np.sum(j1)          # since j2 is 1.0
+        J_JT[1, 2] = sum_j1              # since j2 is 1.0
         J_JT[1, 3] = np.dot(j1, j3)
-        
+
         J_JT[2, 2] = float(N)            # np.dot(1.0, 1.0) for N elements
-        J_JT[2, 3] = np.sum(j3)          # since j2 is 1.0
-        
+        J_JT[2, 3] = sum_j3              # since j2 is 1.0
+
         J_JT[3, 3] = np.dot(j3, j3)
-        
+
         # Compute J_r vector elements using SIMD-accelerated dot products
         J_r[0] = np.dot(j0, r)
         J_r[1] = np.dot(j1, r)
-        J_r[2] = np.sum(r)               # since j2 is 1.0
+        J_r[2] = sum_r                   # since j2 is 1.0
         J_r[3] = np.dot(j3, r)
 
         # Mirror the upper triangle to the lower triangle (Exploit Symmetry)
@@ -415,7 +436,7 @@ def _tune_burst_measurements(
         J_JT[3, 3] += 1e-6
 
         # Solve system
-        delta, success = _solve_4x4(J_JT, J_r)
+        success = _solve_4x4(J_JT, J_r, solve_M, delta)
         if not success:
             break
 
@@ -485,44 +506,106 @@ def _demod_burst(
 
     return burst_center, burst_phase_deg, burst_amplitude, burst_magnitude, burst_dc, burst_frequency, I, Q
 
-def _get_upconverted_burst(
+
+@njit(cache=True, nogil=True, fastmath=False)
+def _demod_bursts(
+    bursts,
+    burst_starts,
+    burst_lens,
+    burst_sin,
+    burst_cos,
+    fsc
+):
+    """
+    Runs _demod_burst on each row of bursts (row i holds burst_lens[i] valid samples).
+    Returns an (n, 8) array holding the _demod_burst results for each row.
+    """
+    count = len(burst_lens)
+    results = np.empty((count, 8), dtype=np.float64)
+    for i in range(count):
+        burst_len = burst_lens[i]
+        burst_results = _demod_burst(
+            bursts[i, :burst_len], burst_starts[i], burst_len, burst_sin, burst_cos, fsc
+        )
+        for j in range(8):
+            results[i, j] = burst_results[j]
+
+    return results
+
+
+# Number of lines measured per batched _demod_bursts call in _get_phase_sequence
+BURST_BATCH_LINES = 32
+
+
+def _get_upconverted_bursts(
     chroma,
     chroma_heterodyne,
     chroma_filter,
-    current_phase,
+    start_phase,
+    phase_step,
     burst_area,
     burst_sin,
     burst_cos,
-    line_number,
+    first_line,
+    line_count,
     line_offset,
     outwidth,
     fsc
 ):
+    """
+    Up-converts, filters and measures the color burst of line_count consecutive lines
+    starting at first_line. The heterodyne phase starts at start_phase and advances by
+    phase_step every line. The burst fitting for all lines is done in a single numba call.
+    Returns a list of (phase, BurstInfo).
+    """
     burst_filter_padding = burst_area[0]
-    line_start = (line_number - line_offset) * outwidth
-    burst_start = max(0, line_start + burst_area[0] - burst_filter_padding)
-    burst_end = min(len(chroma), line_start + burst_area[1] + burst_filter_padding)
 
-    upconverted_burst = (
-        chroma_heterodyne[current_phase][burst_start:burst_end]
-        * chroma[burst_start:burst_end]
+    phases = []
+    burst_bounds = []
+    filtered_bursts = []
+    phase = start_phase
+    for line_number in range(first_line, first_line + line_count):
+        line_start = (line_number - line_offset) * outwidth
+        burst_start = max(0, line_start + burst_area[0] - burst_filter_padding)
+        burst_end = min(len(chroma), line_start + burst_area[1] + burst_filter_padding)
+
+        upconverted_burst = (
+            chroma_heterodyne[phase][burst_start:burst_end]
+            * chroma[burst_start:burst_end]
+        )
+
+        # filter out noise so only the color burst is present
+        filtered_padded = sosfiltfilt_rust(chroma_filter, upconverted_burst)
+        filtered_bursts.append(filtered_padded[burst_filter_padding:-burst_filter_padding])
+
+        phases.append(phase)
+        burst_bounds.append((burst_start, burst_end))
+        phase = (phase + phase_step) % 4
+
+    burst_lens = np.array([len(filtered) for filtered in filtered_bursts], dtype=np.int64)
+    # keep the filter output dtype, the burst measurement arithmetic depends on it
+    bursts = np.zeros((line_count, burst_lens.max()), dtype=filtered_bursts[0].dtype)
+    for i, filtered in enumerate(filtered_bursts):
+        bursts[i, :len(filtered)] = filtered
+
+    burst_starts = np.array(
+        [burst_start + burst_filter_padding for burst_start, _ in burst_bounds], dtype=np.int64
     )
+    results = _demod_bursts(bursts, burst_starts, burst_lens, burst_sin, burst_cos, fsc).tolist()
 
-    # filter out noise so only the color burst is present
-    filtered_padded = sosfiltfilt_rust(chroma_filter, upconverted_burst)
-    filtered = filtered_padded[burst_filter_padding:-burst_filter_padding]
+    return [
+        (
+            phases[i],
+            BurstInfo(
+                first_line + i,
+                burst_bounds[i][0],
+                burst_bounds[i][1],
+                *results[i]
+            )
+        )
+        for i in range(line_count)
+    ]
 
-    burst_len = len(filtered)
-    burst_results = _demod_burst(
-        filtered, burst_start + burst_filter_padding, burst_len, burst_sin, burst_cos, fsc
-    )
-
-    return BurstInfo(
-        line_number,
-        burst_start,
-        burst_end,
-        *burst_results
-    )
 
 def _get_phase_sequence(
     chroma,
@@ -580,6 +663,37 @@ def _get_phase_sequence(
           Possibly a 2D aware detection could be used to determine where the color phase is rotated +-90 degrees relative to the lines above and below
     """
 
+    # The bursts are measured ahead in batches, assuming the phase keeps advancing by the
+    # current track rotation. Each burst only depends on its line and heterodyne phase, so a
+    # cached burst is reused only if it was measured with the phase requested for that line.
+    burst_cache = {}
+
+    def get_burst(line_number, phase, phase_step):
+        cached = burst_cache.get(line_number)
+        if cached is not None and cached[0] == phase:
+            return cached[1]
+
+        line_count = min(BURST_BATCH_LINES, last_line - line_number)
+        bursts = _get_upconverted_bursts(
+            chroma,
+            chroma_heterodyne,
+            chroma_filter,
+            phase,
+            phase_step,
+            burstarea,
+            burst_sin,
+            burst_cos,
+            line_number,
+            line_count,
+            lineoffset,
+            outwidth,
+            fsc
+        )
+        for i, burst in enumerate(bursts):
+            burst_cache[line_number + i] = burst
+
+        return bursts[0][1]
+
     current_phase = 0
     use_next_phase = False
     for linenumber in range(lineoffset, last_line):
@@ -591,19 +705,7 @@ def _get_phase_sequence(
             use_next_phase = False
         else:
             current_phase = (current_phase + track_rotation) % 4
-            current_burst = _get_upconverted_burst(
-                chroma,
-                chroma_heterodyne,
-                chroma_filter,
-                current_phase,
-                burstarea,
-                burst_sin,
-                burst_cos,
-                linenumber,
-                lineoffset,
-                outwidth,
-                fsc
-            )
+            current_burst = get_burst(linenumber, current_phase, track_rotation)
 
         # check if the track has rotated around the head switching area
         if (
@@ -613,19 +715,7 @@ def _get_phase_sequence(
         ):
             # get the next burst using the phase rotation for the current track
             next_phase = (current_phase + track_rotation) % 4
-            next_burst = _get_upconverted_burst(
-                chroma,
-                chroma_heterodyne,
-                chroma_filter,
-                next_phase,
-                burstarea,
-                burst_sin,
-                burst_cos,
-                linenumber + 1,
-                lineoffset,
-                outwidth,
-                fsc
-            )
+            next_burst = get_burst(linenumber + 1, next_phase, track_rotation)
 
             if color_system == "NTSC":
                 # check one line back
