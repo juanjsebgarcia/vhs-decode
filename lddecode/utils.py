@@ -729,7 +729,10 @@ class LoadLDF:
                 for rf in self._resampler.resample(frame):
                     if stop_event.is_set():
                         return
-                    data = bytes(rf.planes[0])
+                    # The plane buffer is padded for alignment: with an odd
+                    # frame size (e.g. 65535-sample FLAC blocks) it holds a
+                    # stray extra sample, so take exactly rf.samples.
+                    data = bytes(rf.planes[0])[: rf.samples * 2]
 
                     if skip_samples > 0:
                         skip_bytes = min(skip_samples * 2, len(data))
