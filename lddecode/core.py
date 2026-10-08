@@ -1181,8 +1181,31 @@ class DemodCache:
 
         self.deqeue_thread.start()
 
+        # Speculative assembly of the next read() on a background thread; see
+        # assembler(). Not used single-threaded (--threads 0).
+        self.block_ready_cv     = threading.Condition(self.lock)
+        self.assembly_lock      = threading.Lock()
+        self.assembly_queue     = Queue()
+        self.assembly_target    = None
+        self.assembly           = None
+        self.assembler_stop     = False
+        self.assembly_wait_block = None
+        self.last_read_begin    = None
+        self.assembler_thread   = None
+
+        if num_worker_threads > 0:
+            self.assembler_thread = threading.Thread(target=self.assembler, daemon=True)
+            self.assembler_thread.start()
+
     def end(self):
         if not self.ended:
+            if getattr(self, "assembler_thread", None) is not None:
+                with self.lock:
+                    self.assembler_stop = True
+                    self.block_ready_cv.notify_all()
+                self.assembly_queue.put(None)
+                self.assembler_thread.join()
+
             # stop workers
             for i in self.threads:
                 self.q_in.put(None)
@@ -1492,17 +1515,11 @@ class DemodCache:
                         self.rf.blockcut : -self.rf.blockcut_end
                     ]
 
+                if blocknum == self.assembly_wait_block:
+                    self.block_ready_cv.notify_all()
+
     @profile
     def read(self, begin, length, MTF=0, getraw = False, forceredo=False):
-        # transpose the cache by key, not block
-        # This is a list of entries in the output from the threaded
-        # demodblock function that if they exist is to be merged together
-        # to form contiguous arrays for further processing. This excludes "fft"
-        # as while that is contained in the output, it is only there so
-        # it can be reused case mtf checking fails and is not used later and
-        # thus does not need to be concatenated.
-        t = {"input": [], "video": [], "audio": [], "efm": [], "rfhpf": []}
-
         self.currentMTF = MTF
         if forceredo:
             self.request += 1
@@ -1541,18 +1558,15 @@ class DemodCache:
             return None
 
         # Now coalesce the output
-        for b in range(begin // self.blocksize, (end // self.blocksize) + 1):
-            for k in t.keys():
-                if k in self.blocks[b]["demod"]:
-                    t[k].append(self.blocks[b]["demod"][k])
-                elif k in self.blocks[b]:
-                    t[k].append(self.blocks[b][k])
+        t = self.collect_block_arrays(toread)
 
         self.prune_cache()
 
-        rv = {}
-        for k in t.keys():
-            rv[k] = concatenate_blocks(t[k]) if len(t[k]) else None
+        rv = self.take_assembly(t, toread)
+        if rv is None:
+            rv = {}
+            for k in t.keys():
+                rv[k] = concatenate_blocks(t[k]) if len(t[k]) else None
 
         if rv["audio"] is not None:
             rv["audio_phase1"] = rv["audio"]
@@ -1561,6 +1575,154 @@ class DemodCache:
         rv["startloc"] = (begin // self.blocksize) * self.blocksize
 
         self.doread(toread_prefetch, MTF, prefetch=True)
+
+        self.schedule_assembly(begin, length)
+
+        return rv
+
+    def collect_block_arrays(self, blocknums):
+        """Return, per output key, the list of per-block arrays read() joins."""
+        # transpose the cache by key, not block
+        # This is a list of entries in the output from the threaded
+        # demodblock function that if they exist is to be merged together
+        # to form contiguous arrays for further processing. This excludes "fft"
+        # as while that is contained in the output, it is only there so
+        # it can be reused case mtf checking fails and is not used later and
+        # thus does not need to be concatenated.
+        t = {"input": [], "video": [], "audio": [], "efm": [], "rfhpf": []}
+
+        for b in blocknums:
+            for k in t.keys():
+                if k in self.blocks[b]["demod"]:
+                    t[k].append(self.blocks[b]["demod"][k])
+                elif k in self.blocks[b]:
+                    t[k].append(self.blocks[b][k])
+
+        return t
+
+    def schedule_assembly(self, begin, length):
+        """Start assembling the blocks the next read() is expected to need.
+
+        Joining ~25 blocks into field-length arrays costs several ms per read
+        on the decode thread, which is the critical path. Consecutive reads
+        normally advance by about the same amount, so the next read's blocks
+        (already being demodulated by the prefetch) can be joined ahead of time
+        on an otherwise idle thread, with a few blocks of margin either side.
+        """
+        if self.assembler_thread is None:
+            return
+
+        last_begin, self.last_read_begin = self.last_read_begin, begin
+        if last_begin is None or not (0 < begin - last_begin <= length):
+            return
+
+        margin = 2
+        next_begin = begin + (begin - last_begin)
+        job = (
+            max(0, (next_begin // self.blocksize) - margin),
+            ((next_begin + length) // self.blocksize) + margin,
+        )
+
+        with self.lock:
+            # Any assembly in flight for an older prediction is abandoned.
+            with self.assembly_lock:
+                self.assembly_target = job
+                self.assembly = None
+            self.block_ready_cv.notify_all()
+
+        self.assembly_queue.put(job)
+
+    def assembler(self):
+        """Background thread: join the blocks of a predicted read (see
+        schedule_assembly). The result is only used by take_assembly() if it
+        was built from exactly the same block arrays the read would join."""
+        while True:
+            job = self.assembly_queue.get()
+            if job is None:
+                return
+
+            blocknums = range(job[0], job[1] + 1)
+            t = None
+
+            with self.lock:
+                while not self.assembler_stop and self.assembly_target == job:
+                    blocks = [self.blocks.get(b) for b in blocknums]
+                    if any(block is None for block in blocks):
+                        # End of input, or not loaded - give up on this one
+                        break
+
+                    pending = [
+                        b
+                        for b, block in zip(blocknums, blocks)
+                        if "demod" not in block
+                        or "input" not in block
+                        or block.get("waiting", False)
+                    ]
+                    if not pending:
+                        t = self.collect_block_arrays(blocknums)
+                        break
+
+                    # Only get woken when the last outstanding block is done
+                    # (they finish roughly in order), to keep this thread from
+                    # contending for the GIL on every block.
+                    self.assembly_wait_block = pending[-1]
+                    self.block_ready_cv.wait()
+
+                self.assembly_wait_block = None
+
+            if t is None:
+                continue
+
+            assembled = {}
+            for k, arrays in t.items():
+                if len(arrays) == len(blocknums) and all(
+                    a.dtype == arrays[0].dtype for a in arrays
+                ):
+                    bounds = np.cumsum([0] + [len(a) for a in arrays])
+                    assembled[k] = (arrays, concatenate_blocks(arrays), bounds)
+
+            with self.assembly_lock:
+                if self.assembly_target == job:
+                    self.assembly = (blocknums, assembled)
+
+    def take_assembly(self, t, blocknums):
+        """Return read()'s output from a speculative assembly, or None.
+
+        The assembly is only used if, for every key, the read would join exactly
+        the same block array objects (in the same order) that the assembly was
+        built from. The result then holds the same bytes np.concatenate would
+        produce, just as views into the (slightly larger) assembled arrays.
+        """
+        with self.assembly_lock:
+            assembly = self.assembly
+            self.assembly = None
+            self.assembly_target = None
+
+        if assembly is None:
+            return None
+
+        assembled_blocknums, assembled = assembly
+        offset = blocknums[0] - assembled_blocknums[0]
+        count = len(blocknums)
+        if offset < 0 or blocknums[-1] > assembled_blocknums[-1]:
+            return None
+
+        rv = {}
+        for k, arrays in t.items():
+            if not len(arrays):
+                rv[k] = None
+                continue
+
+            if len(arrays) != count or k not in assembled:
+                return None
+
+            source_arrays, joined, bounds = assembled[k]
+            if any(
+                a is not b for a, b in zip(arrays, source_arrays[offset : offset + count])
+            ):
+                return None
+
+            rv[k] = joined[bounds[offset] : bounds[offset + count]]
 
         return rv
 
