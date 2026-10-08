@@ -1417,8 +1417,55 @@ def LRUupdate(l, k):
     l.insert(0, k)
 
 
+class DemodColumns:
+    """Demodulator output channels kept as separate contiguous arrays.
+
+    Replaces a packed np.rec.array: channel["name"] returns the channel array,
+    slicing (channel[a:b]) slices every channel, len() is the sample count.
+    Contiguous channels avoid the interleaving copy when a block is built and the
+    unaligned strided reads (and copies) every consumer pays on a record array.
+    """
+
+    __slots__ = ("columns",)
+
+    def __init__(self, columns):
+        self.columns = columns
+
+    @property
+    def names(self):
+        return tuple(self.columns)
+
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            return self.columns[key]
+        return DemodColumns({k: v[key] for k, v in self.columns.items()})
+
+    def __contains__(self, name):
+        return name in self.columns
+
+    def __len__(self):
+        return len(next(iter(self.columns.values())))
+
+
+def same_block_layout(a, b):
+    """True if a and b are demod blocks concatenate_blocks() can join"""
+    if isinstance(a, DemodColumns) or isinstance(b, DemodColumns):
+        return (
+            isinstance(a, DemodColumns)
+            and isinstance(b, DemodColumns)
+            and a.names == b.names
+            and all(a[k].dtype == b[k].dtype for k in a.names)
+        )
+    return a.dtype == b.dtype
+
+
 def concatenate_blocks(blocks):
     """Concatenate demodulator cache blocks, being sensitive to performance"""
+    if isinstance(blocks[0], DemodColumns):
+        return DemodColumns(
+            {k: np.concatenate([b[k] for b in blocks]) for k in blocks[0].names}
+        )
+
     dtype = blocks[0].dtype
     if dtype.names is None:
         return np.concatenate(blocks)

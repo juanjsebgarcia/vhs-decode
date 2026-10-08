@@ -1490,9 +1490,15 @@ class VHSRFDecode(ldd.RFDecode):
             out_video = demod
 
         # demod_burst is a bit misleading, but keeping the naming for compatability.
-        video_out = np.rec.array(
-            [out_video, out_video05, out_chroma, env],
-            names=["demod", "demod_05", "demod_burst", "envelope"],
+        # Kept as separate contiguous arrays rather than a packed record array
+        # (same values and dtypes), see DemodColumns.
+        video_out = lddu.DemodColumns(
+            {
+                "demod": out_video,
+                "demod_05": out_video05,
+                "demod_burst": out_chroma,
+                "envelope": env,
+            }
         )
 
         rv["video"] = (
