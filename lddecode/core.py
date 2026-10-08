@@ -2767,6 +2767,20 @@ class Field:
         ):
             return self.interpolated_pixel_locs, self.wowfactors
 
+        spl, scaled_pixel_locs = self.wow_spline(actual_linelocs)
+
+        # interpolate the expected pixel location
+        self.interpolated_pixel_locs = spl(scaled_pixel_locs)
+        # amount of wow for each scaled pixel
+        self.wowfactors = spl(scaled_pixel_locs, 1)
+        self.wow_inputs = (wow_params, actual_linelocs)
+
+        return self.interpolated_pixel_locs, self.wowfactors
+
+    def wow_spline(self, actual_linelocs):
+        """Spline mapping output sample locations to input sample locations,
+           and the (scaled) output sample locations to evaluate it at
+        """
         expected_linelocs = np.array([i * self.inlinelen for i in range(len(actual_linelocs))], dtype=np.float64)
 
         outscale = self.inlinelen / self.outlinelen
@@ -2789,13 +2803,7 @@ class Field:
         # scale up to compute where the output pixel would fall on the interpolated line loc
         scaled_pixel_locs = np.arange(outsamples + outline_offset) * outscale
 
-        # interpolate the expected pixel location
-        self.interpolated_pixel_locs = spl(scaled_pixel_locs)
-        # amount of wow for each scaled pixel
-        self.wowfactors = spl(scaled_pixel_locs, 1)
-        self.wow_inputs = (wow_params, actual_linelocs)
-
-        return self.interpolated_pixel_locs, self.wowfactors
+        return spl, scaled_pixel_locs
 
     def get_level_adjusts(self, wowfactors, outwidth):
         """Level adjusts for scale_field_spans, reused while the wow factors are unchanged"""
@@ -2817,13 +2825,32 @@ class Field:
         Everything else in the returned field is 0.
         """
         outwidth = self.outlinelen
+        span_start = max(span_start, 0)
+        span_end = min(span_end, outwidth)
         dsout = np.zeros((self.outlinecount * outwidth), dtype=np.float32)
-        interpolated_pixel_locs, wowfactors = self.computewow_scaled()
+
+        spl, scaled_pixel_locs = self.wow_spline(np.array(self.linelocs, dtype=np.float64))
+        # the level adjusts need the wow factors of the whole field
+        wowfactors = spl(scaled_pixel_locs, 1)
+        level_adjusts = compute_level_adjusts(
+            wowfactors,
+            outwidth,
+            wow_level_adjust_smoothing=self.wow_level_adjust_smoothing,
+        )
+
+        # but the sample locations are only needed for the samples that are computed
+        needed = (
+            np.arange(self.outlinecount)[:, None] * outwidth
+            + np.arange(span_start, span_end)[None, :]
+        ).ravel() + (self.lineoffset + 1) * outwidth
+        interpolated_pixel_locs = np.zeros_like(scaled_pixel_locs)
+        interpolated_pixel_locs[needed] = spl(scaled_pixel_locs[needed])
+
         scale_field_spans(
             self.data["video"][channel].astype(np.float32, copy=False),
             dsout,
             interpolated_pixel_locs,
-            self.get_level_adjusts(wowfactors, outwidth),
+            level_adjusts,
             self.rf.downscale_sinc_lut,
             self.lineoffset,
             outwidth,
