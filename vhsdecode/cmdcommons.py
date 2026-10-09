@@ -34,9 +34,19 @@ def sizeof_fmt(num: int, suffix: str = "B") -> str:
     return f"{num:.1f} Yi{suffix}"
 
 
-def get_free_space(path: str) -> int:
+def get_free_space(path: str, enough: Optional[int] = None) -> int:
+    """Free space at path in bytes.
+
+    If enough is given and statvfs() already reports at least that much, that
+    figure is returned without asking df (df can only report more).
+    """
     # statvfs() can under-report free space on some macOS SMB mounts; df is correct there.
     free_space = shutil.disk_usage(path).free
+    if enough is not None and free_space >= enough:
+        # Running df means forking the (large) decoder process. After every
+        # fork each page the decoder writes to takes a copy-on-write fault,
+        # several thousand per field, so only do it when the answer matters.
+        return free_space
     if sys.platform == "darwin":
         try:
             out = subprocess.run(
@@ -81,7 +91,7 @@ def test_output_file(output_file: Optional[str]) -> bool:
 
     # get the free space in the output file directory
     try:
-        free_space = get_free_space(output_file_dir)
+        free_space = get_free_space(output_file_dir, enough=1024 * 1024 * 1024)
         if free_space < 1024 * 1024 * 1024:
             print(
                 f"WARN: output file directory {output_file_dir} has {sizeof_fmt(free_space)} free space"
