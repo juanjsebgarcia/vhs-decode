@@ -66,6 +66,11 @@ def _fallback_version() -> str:
 
 __version__ = _read_version_file() or _fallback_version()
 
+# Make numba's on-disk cache safe when several decodes run at the same time.
+from lddecode import numba_cache as _numba_cache
+
+_numba_cache.install()
+
 __all__ = [
     "audio",
     "commpy_filters",

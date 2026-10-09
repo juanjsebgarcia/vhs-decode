@@ -35,3 +35,8 @@ try:
             _nb_loader("svml_dispmd")
 except:
     pass
+
+# Make numba's on-disk cache safe when several decodes run at the same time.
+from lddecode import numba_cache as _numba_cache
+
+_numba_cache.install()
