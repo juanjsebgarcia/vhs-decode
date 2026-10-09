@@ -229,7 +229,8 @@ sinc_phase_count = 2**16
 
 
 @njit(nogil=True, cache=True, fastmath=True)
-def scale_field(buf, dsout, interpolated_pixel_locs, wowfactors, sinc_lut, lineoffset, outwidth, wow_level_adjust_smoothing = 0, level_adjust_threshold = 15, shift: float = 0.0):
+def compute_level_adjusts(wowfactors, outwidth, wow_level_adjust_smoothing = 0, level_adjust_threshold = 15):
+    """Per output sample amplitude correction used by scale_field, derived from the wow factors."""
     # average out any unusual spikes in wow that happen on a per line basis
     # this indicates an hsync tbc error vs. being normal wow from playback speed variations
     # in this case for level adjusting we just want to fallback to the average wow to avoid a bright or dark line
@@ -252,37 +253,56 @@ def scale_field(buf, dsout, interpolated_pixel_locs, wowfactors, sinc_lut, lineo
         for i in range(1, len(level_adjusts)):
             level_adjusts[i] = alpha * level_adjusts[i] + one_minus_alpha * level_adjusts[i-1]
 
+    return level_adjusts
+
+
+@njit(nogil=True, cache=True, fastmath=True)
+def scale_field_spans(buf, dsout, interpolated_pixel_locs, level_adjusts, sinc_lut, lineoffset, outwidth, span_start, span_end, shift: float = 0.0):
+    """Resample buf into dsout using precomputed level adjusts (see compute_level_adjusts).
+
+    Only the output samples in [span_start, span_end) of each output line are computed,
+    the rest of dsout is left untouched. Pass span_start=0, span_end=outwidth for the whole field.
+    """
     half_taps_m1 = (sinc_tap_count // 2) - 1
 
     dsout_start = outwidth * (lineoffset + 1)
-    dsout_end = len(dsout) + dsout_start
-    for i in range(dsout_start, dsout_end):
-        # compensates for the amplitude/frequency shift caused by FM demodulation under varying playback speed.
-        level_adjust = level_adjusts[i]
+    dsout_len = len(dsout)
+    for line_start in range(0, dsout_len, outwidth):
+        out_begin = min(max(line_start + span_start, 0), dsout_len)
+        out_end = min(max(line_start + span_end, 0), dsout_len)
+        for i in range(out_begin + dsout_start, out_end + dsout_start):
+            # compensates for the amplitude/frequency shift caused by FM demodulation under varying playback speed.
+            level_adjust = level_adjusts[i]
 
-        # Adding the positive shift pulls future (late) samples backward into alignment.
-        # TODO: THIS NEEDS TO BE PUSHED UPSTREAM NOT HERE!!!11
-        coord = np.float32(interpolated_pixel_locs[i] + shift)
-        coord_int = int(coord)
+            # Adding the positive shift pulls future (late) samples backward into alignment.
+            # TODO: THIS NEEDS TO BE PUSHED UPSTREAM NOT HERE!!!11
+            coord = np.float32(interpolated_pixel_locs[i] + shift)
+            coord_int = int(coord)
 
-        # fractional phase
-        frac = coord - coord_int
+            # fractional phase
+            frac = coord - coord_int
 
-        # sinc_phase_count is 2**16, so the nearest tabulated phase is already
-        # accurate far below float32 precision. Interpolating between two
-        # adjacent phases would double LUT reads and add per-tap math in the
-        # innermost loop of the decoder for no change in output.
-        # If the LUT gets smaller, consider adding linear interpolation.
-        phase = int(frac * sinc_phase_count + np.float32(0.5))
-        w = sinc_lut[phase]
+            # sinc_phase_count is 2**16, so the nearest tabulated phase is already
+            # accurate far below float32 precision. Interpolating between two
+            # adjacent phases would double LUT reads and add per-tap math in the
+            # innermost loop of the decoder for no change in output.
+            # If the LUT gets smaller, consider adding linear interpolation.
+            phase = int(frac * sinc_phase_count + np.float32(0.5))
+            w = sinc_lut[phase]
 
-        start = coord_int - half_taps_m1
+            start = coord_int - half_taps_m1
 
-        result = 0.0
-        for t in range(sinc_tap_count):
-            result += buf[start + t] * w[t]
+            result = 0.0
+            for t in range(sinc_tap_count):
+                result += buf[start + t] * w[t]
 
-        dsout[i - dsout_start] = level_adjust * result
+            dsout[i - dsout_start] = level_adjust * result
+
+
+@njit(nogil=True, cache=True, fastmath=True)
+def scale_field(buf, dsout, interpolated_pixel_locs, wowfactors, sinc_lut, lineoffset, outwidth, wow_level_adjust_smoothing = 0, level_adjust_threshold = 15, shift: float = 0.0):
+    level_adjusts = compute_level_adjusts(wowfactors, outwidth, wow_level_adjust_smoothing, level_adjust_threshold)
+    scale_field_spans(buf, dsout, interpolated_pixel_locs, level_adjusts, sinc_lut, lineoffset, outwidth, 0, outwidth, shift)
 
 
 frequency_suffixes = [

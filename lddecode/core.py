@@ -28,7 +28,8 @@ from . import efm_pll
 from . import ac3rf
 from .utils import ldf_pipe, traceback
 from .utils import nb_mean, nb_median, nb_round, nb_min, nb_max, nb_abs, nb_absmax, n_orgt
-from .utils import polar2z, sqsum, genwave, dsa_rescale_and_clip, scale, scale_field, rms
+from .utils import polar2z, sqsum, genwave, dsa_rescale_and_clip, scale, rms
+from .utils import compute_level_adjusts, scale_field_spans
 from .utils import findpeaks, findpulses, calczc, inrange, roundfloat
 from .utils import LRUupdate, clb_findbursts, angular_mean_helper, phase_distance
 from .utils import build_hilbert, unwrap_hilbert, emphasis_iir, filtfft
@@ -1773,6 +1774,11 @@ class Field:
 
         self.interpolated_pixel_locs = None
         self.wowfactors = None
+        # inputs of the last computewow_scaled call, used to reuse its results
+        # when the field is downscaled again with the same line locations
+        self.wow_inputs = None
+        # (wowfactors, outwidth, level adjusts) from the last get_level_adjusts call
+        self.level_adjusts_cache = None
 
         # On NTSC linecount rounds up to 263, and PAL 313
         self.outlinecount = (self.rf.SysParams["frame_lines"] // 2) + 1
@@ -2744,6 +2750,37 @@ class Field:
            and scale input samples to output samples
         """
         actual_linelocs = np.array(self.linelocs, dtype=np.float64)
+
+        # The result only depends on these inputs, a field is usually downscaled
+        # more than once (luma and chroma) with the same line locations.
+        wow_params = (
+            self.inlinelen,
+            self.outlinelen,
+            self.outlinecount,
+            self.lineoffset,
+            self.wow_interpolation_method,
+        )
+        if (
+            self.wow_inputs is not None
+            and self.wow_inputs[0] == wow_params
+            and np.array_equal(self.wow_inputs[1], actual_linelocs)
+        ):
+            return self.interpolated_pixel_locs, self.wowfactors
+
+        spl, scaled_pixel_locs = self.wow_spline(actual_linelocs)
+
+        # interpolate the expected pixel location
+        self.interpolated_pixel_locs = spl(scaled_pixel_locs)
+        # amount of wow for each scaled pixel
+        self.wowfactors = spl(scaled_pixel_locs, 1)
+        self.wow_inputs = (wow_params, actual_linelocs)
+
+        return self.interpolated_pixel_locs, self.wowfactors
+
+    def wow_spline(self, actual_linelocs):
+        """Spline mapping output sample locations to input sample locations,
+           and the (scaled) output sample locations to evaluate it at
+        """
         expected_linelocs = np.array([i * self.inlinelen for i in range(len(actual_linelocs))], dtype=np.float64)
 
         outscale = self.inlinelen / self.outlinelen
@@ -2766,12 +2803,62 @@ class Field:
         # scale up to compute where the output pixel would fall on the interpolated line loc
         scaled_pixel_locs = np.arange(outsamples + outline_offset) * outscale
 
-        # interpolate the expected pixel location
-        self.interpolated_pixel_locs = spl(scaled_pixel_locs)
-        # amount of wow for each scaled pixel
-        self.wowfactors = spl(scaled_pixel_locs, 1)
+        return spl, scaled_pixel_locs
 
-        return self.interpolated_pixel_locs, self.wowfactors
+    def get_level_adjusts(self, wowfactors, outwidth):
+        """Level adjusts for scale_field_spans, reused while the wow factors are unchanged"""
+        cache = self.level_adjusts_cache
+        if cache is not None and cache[0] is wowfactors and cache[1] == outwidth:
+            return cache[2]
+
+        level_adjusts = compute_level_adjusts(
+            wowfactors,
+            outwidth,
+            wow_level_adjust_smoothing=self.wow_level_adjust_smoothing,
+        )
+        self.level_adjusts_cache = (wowfactors, outwidth, level_adjusts)
+        return level_adjusts
+
+    def downscale_line_spans(self, channel, span_start, span_end):
+        """Same output as downscale(channel=channel) (video only, no audio), but only
+        the samples in [span_start, span_end) of each output line are computed.
+        Everything else in the returned field is 0.
+        """
+        outwidth = self.outlinelen
+        span_start = max(span_start, 0)
+        span_end = min(span_end, outwidth)
+        dsout = np.zeros((self.outlinecount * outwidth), dtype=np.float32)
+
+        spl, scaled_pixel_locs = self.wow_spline(np.array(self.linelocs, dtype=np.float64))
+        # the level adjusts need the wow factors of the whole field
+        wowfactors = spl(scaled_pixel_locs, 1)
+        level_adjusts = compute_level_adjusts(
+            wowfactors,
+            outwidth,
+            wow_level_adjust_smoothing=self.wow_level_adjust_smoothing,
+        )
+
+        # but the sample locations are only needed for the samples that are computed
+        needed = (
+            np.arange(self.outlinecount)[:, None] * outwidth
+            + np.arange(span_start, span_end)[None, :]
+        ).ravel() + (self.lineoffset + 1) * outwidth
+        interpolated_pixel_locs = np.zeros_like(scaled_pixel_locs)
+        interpolated_pixel_locs[needed] = spl(scaled_pixel_locs[needed])
+
+        scale_field_spans(
+            self.data["video"][channel].astype(np.float32, copy=False),
+            dsout,
+            interpolated_pixel_locs,
+            level_adjusts,
+            self.rf.downscale_sinc_lut,
+            self.lineoffset,
+            outwidth,
+            span_start,
+            span_end,
+        )
+
+        return dsout
 
     @profile
     def downscale(
@@ -2842,15 +2929,16 @@ class Field:
 
         dsout = np.zeros((linesout * outwidth), dtype=np.float32)
         interpolated_pixel_locs, wowfactors = self.computewow_scaled()
-        scale_field(
+        scale_field_spans(
             self.data["video"][channel].astype(np.float32, copy=False),
             dsout,
             interpolated_pixel_locs,
-            wowfactors,
+            self.get_level_adjusts(wowfactors, outwidth),
             self.rf.downscale_sinc_lut,
             self.lineoffset,
             outwidth,
-            wow_level_adjust_smoothing=self.wow_level_adjust_smoothing,
+            0,
+            outwidth,
             shift=shift
         )
 
