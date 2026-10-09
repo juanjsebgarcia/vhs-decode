@@ -2,7 +2,8 @@ use itertools::Itertools;
 use numpy::ndarray::{Array1, ArrayView1};
 use sci_rs::na::RealField;
 use sci_rs::signal::filter::design::Sos;
-use sci_rs::signal::filter::sosfiltfilt_dyn;
+
+use crate::filtfilt::sosfiltfilt_exact;
 
 /// Make a Sos vector from a slice from scipy from a slice instead of a vector
 /// Clone of upstream function just with slice param instead of vector to avoid the extra
@@ -36,7 +37,7 @@ fn f32_sos_from_scipy_dyn_slice(order: usize, sos: &[f64]) -> Vec<Sos<f32>> {
         .collect()
 }
 
-/// Apply a sos filter to the input array using sci_rs
+/// Apply a sos filter to the input array (same result as sci_rs sosfiltfilt_dyn)
 /// and return a new filtered output array
 pub fn sos_filtfilt(
     sos_order: u32,
@@ -44,11 +45,14 @@ pub fn sos_filtfilt(
     input_array: ArrayView1<'_, f64>,
 ) -> Array1<f64> {
     let sos = from_scipy_dyn_slice(sos_order as usize, sos_filter.as_slice().unwrap());
-    let ret = sosfiltfilt_dyn(input_array.iter(), &sos);
+    let ret = match input_array.as_slice() {
+        Some(input) => sosfiltfilt_exact(input, &sos),
+        None => sosfiltfilt_exact(&input_array.to_vec(), &sos),
+    };
     Array1::from_vec(ret)
 }
 
-/// Apply a sos filter using sci_rs
+/// Apply a sos filter (same result as sci_rs sosfiltfilt_dyn)
 /// and return a new filtered output array, single precision version.
 pub fn sos_filtfilt_f32(
     sos_order: u32,
@@ -56,6 +60,9 @@ pub fn sos_filtfilt_f32(
     input_array: ArrayView1<'_, f32>,
 ) -> Array1<f32> {
     let sos = f32_sos_from_scipy_dyn_slice(sos_order as usize, sos_filter.as_slice().unwrap());
-    let ret = sosfiltfilt_dyn(input_array.iter(), &sos);
+    let ret = match input_array.as_slice() {
+        Some(input) => sosfiltfilt_exact(input, &sos),
+        None => sosfiltfilt_exact(&input_array.to_vec(), &sos),
+    };
     Array1::from_vec(ret)
 }

@@ -1,5 +1,6 @@
 mod demod;
 mod filters;
+mod filtfilt;
 mod levels;
 mod ported;
 
