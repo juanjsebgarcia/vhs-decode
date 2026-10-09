@@ -1369,7 +1369,9 @@ class VHSRFDecode(ldd.RFDecode):
         # on sharp transitions. Using filtfilt to avoid phase issues.
         high_boost_applied = False
         if not env_has_zero:  # checks for zeroes on env
-            if self._high_boost is not None:
+            # boost_bpf_mult is 0 on EIAJ, Type B/C, PAL U-matic HI/SP and Hi8;
+            # adding fft(high_part * 0) to the spectrum would only cost time.
+            if self._high_boost:
                 data_filtered = npfft.ifft(indata_fft).real
                 high_part = sosfiltfilt_rust(self.Filters["RFTop"], data_filtered) * (
                     (env_mean * 0.9) / env
