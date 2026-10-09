@@ -1,12 +1,16 @@
+mod demod;
 mod filters;
 mod levels;
 mod ported;
 
 use numpy::ndarray::{Array1, ArrayView1, ArrayViewMut1, Zip};
-use numpy::{Complex64, IntoPyArray, PyArray1, PyReadonlyArray1, PyReadwriteArray1};
+use numpy::{
+    Complex64, IntoPyArray, PyArray1, PyReadonlyArray1, PyReadwriteArray1, PyUntypedArrayMethods,
+};
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 
+use demod::{rf_envelope_impl, rf_filter_hilbert_impl};
 use filters::{sos_filtfilt, sos_filtfilt_f32};
 use levels::fallback_vsync_loc_means_impl;
 use ported::unwrap_angles_impl;
@@ -184,6 +188,56 @@ fn sosfiltfilt_f32<'py>(
     output_array.into_pyarray(py)
 }
 
+/// Applies the real RF filters to the spectrum in place and writes
+/// spectrum * hilbert to analytic, in one pass. Same result as
+/// `for f in filters: spectrum *= f` followed by
+/// `np.multiply(spectrum, hilbert, out=analytic)`.
+#[pyfunction]
+fn rf_filter_hilbert<'py>(
+    py: Python<'py>,
+    mut spectrum: PyReadwriteArray1<'py, Complex64>,
+    filters: Vec<PyReadonlyArray1<'py, f64>>,
+    hilbert: PyReadonlyArray1<'py, f64>,
+    mut analytic: PyReadwriteArray1<'py, Complex64>,
+) -> PyResult<()> {
+    let len = spectrum.len();
+    if hilbert.len() != len || analytic.len() != len || filters.iter().any(|f| f.len() != len)
+    {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "spectrum, filters, hilbert and analytic must have the same length",
+        ));
+    }
+    let hilbert = hilbert.as_slice()?;
+    let filters: Vec<_> = filters.iter().map(|f| f.as_array()).collect();
+    if filters.iter().any(|f| f.as_slice().is_none()) {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "filters must be contiguous",
+        ));
+    }
+    let spectrum = spectrum.as_slice_mut()?;
+    let analytic = analytic.as_slice_mut()?;
+    py.detach(|| rf_filter_hilbert_impl(spectrum, &filters, hilbert, analytic));
+    Ok(())
+}
+
+/// The RF envelope of an analytic signal: the single precision sosfiltfilt of
+/// np.roll(np.abs(analytic.real.astype(np.float32)), shift).
+/// Returns the envelope and whether any of its samples is zero.
+#[pyfunction]
+fn rf_envelope<'py>(
+    py: Python<'py>,
+    order: u32,
+    sos_filter: PyReadonlyArray1<'py, f64>,
+    analytic: PyReadonlyArray1<'py, Complex64>,
+    shift: usize,
+) -> PyResult<(Bound<'py, PyArray1<f32>>, bool)> {
+    let sos_filter = sos_filter.as_array();
+    let analytic = analytic.as_slice()?;
+    let (env, has_zero) =
+        py.detach(|| rf_envelope_impl(order, sos_filter, analytic, shift));
+    Ok((env.into_pyarray(py), has_zero))
+}
+
 #[pyfunction]
 fn check_debug<'py>(
     _py: Python<'py>,
@@ -207,6 +261,8 @@ fn vhsd_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(fallback_vsync_loc_means, m)?)?;
     m.add_function(wrap_pyfunction!(sosfiltfilt, m)?)?;
     m.add_function(wrap_pyfunction!(sosfiltfilt_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(rf_filter_hilbert, m)?)?;
+    m.add_function(wrap_pyfunction!(rf_envelope, m)?)?;
     m.add_function(wrap_pyfunction!(check_debug, m)?)?;
     Ok(())
 }

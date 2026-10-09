@@ -46,7 +46,7 @@ from vhsdecode.compute_video_filters import (
 )
 from vhsdecode import compute_video_filters as cvf
 from vhsdecode.demodcache import DemodCacheTape
-from vhsdecode.rust_utils import sosfiltfilt_rust
+from vhsdecode.rust_utils import sosfiltfilt_rust, rf_filter_hilbert, rf_envelope
 from vhsdecode.dbwriter import DBWriter
 
 
@@ -64,8 +64,6 @@ class DemodBuffers:
         self.complex_c = np.empty(blocklen, dtype=np.complex128)
         self.half_complex_a = np.empty(half, dtype=np.complex128)
         self.half_complex_b = np.empty(half, dtype=np.complex128)
-        self.single_a = np.empty(blocklen, dtype=np.float32)
-        self.single_b = np.empty(blocklen, dtype=np.float32)
         self.double_a = np.empty(blocklen, dtype=np.float64)
 
 
@@ -1351,37 +1349,26 @@ class VHSRFDecode(ldd.RFDecode):
             # are modifying the data in place.
             indata_fft_copy = indata_fft.copy()
 
+        # Applies RF filters, then = indata_fft * self.Filters["hilbert"]
+        rf_filters = [self.Filters["RFVideo"]]
         if self._notch is not None:
-            indata_fft *= self.Filters["FVideoNotchF"]
-
-        # Applies RF filters
-        indata_fft *= self.Filters["RFVideo"]
-
-        # = npfft.ifft(indata_fft * self.Filters["hilbert"]).real.astype(np.single)
-        np.multiply(indata_fft, self.Filters["hilbert"], out=buffers.complex_b)
+            rf_filters.insert(0, self.Filters["FVideoNotchF"])
+        rf_filter_hilbert(
+            indata_fft, rf_filters, self.Filters["hilbert"], out=buffers.complex_b
+        )
         filtered_hilbert = npfft.ifft(buffers.complex_b, out=buffers.complex_c)
-        raw_filtered = buffers.single_a
-        np.copyto(raw_filtered, filtered_hilbert.real, casting="unsafe")
 
         # Calculate an evelope with signal strength using absolute of hilbert transform.
-        # Roll this a bit to compensate for filter delay, value eyballed for now.
-        np.abs(raw_filtered, out=raw_filtered)
-        # = np.roll(raw_filtered, 4)
-        raw_env = buffers.single_b
-        raw_env[4:] = raw_filtered[:-4]
-        raw_env[:4] = raw_filtered[-4:]
-        del raw_filtered
-        # Downconvert to single precision for some possible speedup since we don't need
-        # super high accuracy for the dropout detection.
-        env = sosfiltfilt_rust(self.Filters["FEnvPost"], raw_env)
-
-        del raw_env
+        # Roll this a bit (4 samples) to compensate for filter delay, value eyballed
+        # for now. Done in single precision for some possible speedup since we don't
+        # need super high accuracy for the dropout detection.
+        env, env_has_zero = rf_envelope(self.Filters["FEnvPost"], filtered_hilbert, 4)
         env_mean = np.mean(env)
 
         # Boost high frequencies in areas where the signal is weak to reduce missed zero crossings
         # on sharp transitions. Using filtfilt to avoid phase issues.
         high_boost_applied = False
-        if len(np.where(env == 0)[0]) == 0:  # checks for zeroes on env
+        if not env_has_zero:  # checks for zeroes on env
             if self._high_boost is not None:
                 data_filtered = npfft.ifft(indata_fft).real
                 high_part = sosfiltfilt_rust(self.Filters["RFTop"], data_filtered) * (
