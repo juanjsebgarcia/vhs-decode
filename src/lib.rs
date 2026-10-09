@@ -48,22 +48,14 @@ fn atan2f_fast(y: f32, x: f32) -> f32 {
     }
 }
 
+/// Phase step from angle a to angle b, wrapped to [0, TAU) and scaled to Hz.
 #[inline(always)]
-fn hilbert_two(a: Complex64, b: Complex64, freq: f32) -> f32 {
+fn phase_step(a: f32, b: f32, freq: f32) -> f32 {
     use std::f32::consts::TAU;
 
-    let a = atan2f_fast(a.im as f32, a.re as f32);
-    let b = atan2f_fast(b.im as f32, b.re as f32);
     let diff = b - a;
     let diff = diff - (diff / TAU).floor() * TAU;
     diff * freq / TAU
-}
-
-#[inline(always)]
-fn hilbert_more(a: &[Complex64; 8], b: &[Complex64; 8], out: &mut [f64; 8], freq: f32) {
-    for i in 0..8 {
-        out[i] = hilbert_two(a[i], b[i], freq) as f64;
-    }
 }
 
 #[inline(never)]
@@ -71,18 +63,13 @@ fn hilbert_all(input_slice: &[Complex64], output_slice: &mut [f64], freq: f32) {
     let len = input_slice.len();
     assert_ne!(len, 0);
 
-    let big_chunks = (len - 1) / 8;
-    for i in 0..big_chunks {
-        let prevs_slice = &input_slice[i * 8..(i + 1) * 8];
-        let currs_slice = &input_slice[i * 8 + 1..(i + 1) * 8 + 1];
-        let outs_slice = &mut output_slice[i * 8 + 1..(i + 1) * 8 + 1];
-        let prevs = <&[Complex64; 8]>::try_from(prevs_slice).unwrap();
-        let currs = <&[Complex64; 8]>::try_from(currs_slice).unwrap();
-        let outs = <&mut [f64; 8]>::try_from(outs_slice).unwrap();
-        hilbert_more(prevs, currs, outs, freq);
-    }
-    for i in big_chunks * 8..len - 1 {
-        output_slice[i + 1] = hilbert_two(input_slice[i], input_slice[i + 1], freq) as f64;
+    // The angle of every sample is computed once and used for both steps it is part of.
+    let angles: Vec<f32> = input_slice
+        .iter()
+        .map(|c| atan2f_fast(c.im as f32, c.re as f32))
+        .collect();
+    for (out, pair) in output_slice[1..].iter_mut().zip(angles.windows(2)) {
+        *out = phase_step(pair[0], pair[1], freq) as f64;
     }
 }
 
