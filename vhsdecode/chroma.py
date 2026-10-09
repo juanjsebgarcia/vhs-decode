@@ -4,7 +4,7 @@ import lddecode.utils as lddu
 import lddecode.core as ldd
 import scipy.signal as sps
 import scipy.fft as sps_fft
-from vhsdecode.rust_utils import sosfiltfilt_rust
+from vhsdecode.rust_utils import sosfiltfilt_rust, upconvert_filter_bursts_rust
 
 import numba
 from numba import njit
@@ -562,31 +562,45 @@ def _get_upconverted_bursts(
 
     phases = []
     burst_bounds = []
-    filtered_bursts = []
     phase = start_phase
     for line_number in range(first_line, first_line + line_count):
         line_start = (line_number - line_offset) * outwidth
         burst_start = max(0, line_start + burst_area[0] - burst_filter_padding)
         burst_end = min(len(chroma), line_start + burst_area[1] + burst_filter_padding)
 
-        upconverted_burst = (
-            chroma_heterodyne[phase][burst_start:burst_end]
-            * chroma[burst_start:burst_end]
-        )
-
-        # filter out noise so only the color burst is present
-        filtered_padded = sosfiltfilt_rust(chroma_filter, upconverted_burst)
-        filtered_bursts.append(filtered_padded[burst_filter_padding:-burst_filter_padding])
-
         phases.append(phase)
         burst_bounds.append((burst_start, burst_end))
         phase = (phase + phase_step) % 4
 
-    burst_lens = np.array([len(filtered) for filtered in filtered_bursts], dtype=np.int64)
-    # keep the filter output dtype, the burst measurement arithmetic depends on it
-    bursts = np.zeros((line_count, burst_lens.max()), dtype=filtered_bursts[0].dtype)
-    for i, filtered in enumerate(filtered_bursts):
-        bursts[i, :len(filtered)] = filtered
+    heterodynes = [chroma_heterodyne[phase] for phase in phases]
+    rust_bursts = upconvert_filter_bursts_rust(
+        chroma_filter,
+        chroma,
+        heterodynes,
+        [burst_start for burst_start, _ in burst_bounds],
+        [burst_end for _, burst_end in burst_bounds],
+        burst_filter_padding,
+    )
+    if rust_bursts is not None:
+        bursts, burst_lens = rust_bursts
+    else:
+        filtered_bursts = []
+        for heterodyne, (burst_start, burst_end) in zip(heterodynes, burst_bounds):
+            upconverted_burst = (
+                heterodyne[burst_start:burst_end] * chroma[burst_start:burst_end]
+            )
+
+            # filter out noise so only the color burst is present
+            filtered_padded = sosfiltfilt_rust(chroma_filter, upconverted_burst)
+            filtered_bursts.append(
+                filtered_padded[burst_filter_padding:-burst_filter_padding]
+            )
+
+        burst_lens = np.array([len(filtered) for filtered in filtered_bursts], dtype=np.int64)
+        # keep the filter output dtype, the burst measurement arithmetic depends on it
+        bursts = np.zeros((line_count, burst_lens.max()), dtype=filtered_bursts[0].dtype)
+        for i, filtered in enumerate(filtered_bursts):
+            bursts[i, :len(filtered)] = filtered
 
     burst_starts = np.array(
         [burst_start + burst_filter_padding for burst_start, _ in burst_bounds], dtype=np.int64
