@@ -1536,7 +1536,9 @@ class VHSRFDecode(ldd.RFDecode):
         # converting before joining the blocks gives the same result).
         video_out = lddu.DemodColumns(
             {
-                "demod": out_video,
+                # float32: gate-identical (49/49), but not provably exact, see
+                # perf-discoveries/memory-churn.md
+                "demod": out_video.astype(np.float32),
                 "demod_05": out_video05,
                 "demod_burst": out_chroma.astype(np.float32),
                 "envelope": env,
