@@ -80,6 +80,7 @@ from vhsdecode.hifi.constants import (
     DEFAULT_8MM_EXPANDER_WEIGHTING_TAU_2,
     DEFAULT_8MM_NR_DEEMPHASIS_TAU_1,
     DEFAULT_8MM_NR_DEEMPHASIS_TAU_2,
+    DEFAULT_CARRIER_FILTER,
     DEFAULT_DEMOD,
     DEFAULT_DOC_MODE,
     DEFAULT_FINAL_AUDIO_RATE,
@@ -99,6 +100,8 @@ from vhsdecode.hifi.constants import (
     DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2,
     DEFAULT_VHS_NR_DEEMPHASIS_TAU_1,
     DEFAULT_VHS_NR_DEEMPHASIS_TAU_2,
+    CARRIER_FILTER_FFT,
+    CARRIER_FILTER_IIR,
     DEMOD_HILBERT,
     DEMOD_QUADRATURE,
     DOC_MODE_DISABLED,
@@ -430,6 +433,17 @@ demod_options.add_argument(
     type=str.lower,
     default=DEFAULT_DEMOD,
     help=f"Set the FM demodulation type \n  {DEMOD_QUADRATURE} [default]\n  {DEMOD_HILBERT}",
+)
+demod_options.add_argument(
+    "--carrier_filter",
+    dest="carrier_filter",
+    metavar='',
+    type=str.lower,
+    choices=[CARRIER_FILTER_IIR, CARRIER_FILTER_FFT],
+    default=DEFAULT_CARRIER_FILTER,
+    help=f"Set the carrier bandpass filter implementation \n"
+    f"  {CARRIER_FILTER_IIR} \ttime domain IIR filtfilt [default]\n"
+    f"  {CARRIER_FILTER_FFT} \tsame zero phase response applied with an FFT, several times faster, not bit identical",
 )
 demod_options.add_argument(
     "--bias_guess",
@@ -2250,6 +2264,7 @@ def build_decode_options_from_args(args):
         "preview_only": args.preview_only,
         "preview_available": args.preview or args.preview_real_time or args.preview_only,
         "demod_type": args.demod_type,
+        "carrier_filter": args.carrier_filter,
         "afe_left_carrier_deviation": args.afe_left_carrier_deviation * 10e5,
         "afe_right_carrier_deviation": args.afe_right_carrier_deviation * 10e5,
         "afe_left_carrier": args.afe_left_carrier * 10e5,

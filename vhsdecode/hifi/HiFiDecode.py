@@ -29,8 +29,10 @@ from scipy.signal import (
     find_peaks,
     freqz,
     bilinear,
-    cheby2
+    cheby2,
+    sosfreqz,
 )
+from scipy.fft import rfft, irfft, rfftfreq, next_fast_len
 from scipy.interpolate import interp1d
 from soxr import ResampleStream, resample
 
@@ -57,6 +59,9 @@ from vhsdecode.hifi.constants import (
     DEMOD_HILBERT_IF_RATE,
     DEMOD_QUADRATURE,
     DEMOD_HILBERT,
+    CARRIER_FILTER_IIR,
+    CARRIER_FILTER_FFT,
+    DEFAULT_CARRIER_FILTER,
 )
 
 # audio processing precision
@@ -227,9 +232,13 @@ def plot_responses(*filters, n=2**20):
 
 
 class AFEFilterable:
-    def __init__(self, filters_params, sample_rate, channel=0):
+    def __init__(self, filters_params, sample_rate, channel=0, carrier_filter=CARRIER_FILTER_IIR):
         self.samp_rate = sample_rate
         self.filter_params = filters_params
+        self.carrier_filter = carrier_filter
+        # zero phase frequency response, cached for the last fft length used
+        self.zero_phase_response_len = None
+        self.zero_phase_response = None
 
         if channel == 0:
             bandpass_width = self.filter_params.LNotchWidth
@@ -238,20 +247,67 @@ class AFEFilterable:
             bandpass_width = self.filter_params.RNotchWidth
             center = self.filter_params.RCarrierRef
 
-        bandpass_low = center - bandpass_width
-        bandpass_high = center + bandpass_width
+        self.bandpass_low = center - bandpass_width
+        self.bandpass_high = center + bandpass_width
 
         self.bandpass = cheby2(
             N=22,
             rs=220,
-            Wn=[bandpass_low, bandpass_high],
+            Wn=[self.bandpass_low, self.bandpass_high],
             btype="bandpass",
             fs=sample_rate,
             output="sos",
         )
 
     def work(self, data):
+        if self.carrier_filter == CARRIER_FILTER_FFT:
+            return self.work_spectrum(AFEFilterable.spectrum(data), len(data))
+
         return sosfiltfilt_rust(self.bandpass, data)
+
+    @staticmethod
+    def spectrum(data):
+        # The spectrum is computed once per block and shared by the L and R filters.
+        # The fft length is padded to a fast length; the padding is zeros.
+        fft_len = next_fast_len(len(data), real=True)
+        return rfft(data.astype(REAL_DTYPE, copy=False), n=fft_len), fft_len
+
+    def get_zero_phase_response(self, fft_len):
+        # Running the filter forwards and backwards (sosfiltfilt) has a zero phase
+        # response with a magnitude of |H|^2, so it can be applied as a real gain
+        # on each frequency bin.
+        if self.zero_phase_response_len != fft_len:
+            freqs = rfftfreq(fft_len, d=1 / self.samp_rate)
+            # Wn of a cheby2 filter are the stopband edges, outside of them the
+            # attenuation is at least rs (220 dB), so |H|^2 is below 1e-22 and is left at 0
+            band_start = np.searchsorted(freqs, self.bandpass_low, side="left")
+            band_end = np.searchsorted(freqs, self.bandpass_high, side="right")
+            _, h = sosfreqz(self.bandpass, worN=freqs[band_start:band_end], fs=self.samp_rate)
+
+            self.zero_phase_response = (
+                band_start,
+                band_end,
+                (h.real * h.real + h.imag * h.imag).astype(REAL_DTYPE),
+            )
+            self.zero_phase_response_len = fft_len
+
+        return self.zero_phase_response
+
+    def work_spectrum(self, spectrum, length):
+        data_spectrum, fft_len = spectrum
+        band_start, band_end, response = self.get_zero_phase_response(fft_len)
+
+        filtered_spectrum = np.zeros(len(data_spectrum), dtype=data_spectrum.dtype)
+        np.multiply(
+            data_spectrum[band_start:band_end],
+            response,
+            out=filtered_spectrum[band_start:band_end],
+        )
+
+        # the circular convolution only differs from sosfiltfilt at the block edges,
+        # within the length of the impulse response (< 0.5 ms for VHS), which is
+        # removed by pre_trim and the block overlap
+        return irfft(filtered_spectrum, n=fft_len)[:length]
 
 class FMDiscriminator:
     def __init__(
@@ -1131,6 +1187,7 @@ class HiFiDecode:
 
         self.audio_rate: int = 192000
         self.audio_final_rate: int = int(options["audio_rate"])
+        self.carrier_filter: str = options.get("carrier_filter", DEFAULT_CARRIER_FILTER)
 
         (
             self.ifresample_numerator,
@@ -1565,8 +1622,8 @@ class HiFiDecode:
                 else newRC
             )
 
-        afeL = AFEFilterable(self.standard, self.if_rate, 0)
-        afeR = AFEFilterable(self.standard, self.if_rate, 1)
+        afeL = AFEFilterable(self.standard, self.if_rate, 0, self.carrier_filter)
+        afeR = AFEFilterable(self.standard, self.if_rate, 1, self.carrier_filter)
 
         return afeL, afeR
 
@@ -2275,8 +2332,15 @@ class HiFiDecode:
 
         if measure_perf:
             start_carrier_filter = perf_counter()
-        if self.audio_process_params.decode_mode != AUDIO_MODE_MONO_R: filterL = self.afeL.work(rf_data_resampled)
-        if self.audio_process_params.decode_mode != AUDIO_MODE_MONO_L: filterR = self.afeR.work(rf_data_resampled)
+        if self.carrier_filter == CARRIER_FILTER_FFT:
+            # one forward fft shared by both channels
+            rf_spectrum = AFEFilterable.spectrum(rf_data_resampled)
+            if self.audio_process_params.decode_mode != AUDIO_MODE_MONO_R: filterL = self.afeL.work_spectrum(rf_spectrum, len(rf_data_resampled))
+            if self.audio_process_params.decode_mode != AUDIO_MODE_MONO_L: filterR = self.afeR.work_spectrum(rf_spectrum, len(rf_data_resampled))
+            del rf_spectrum
+        else:
+            if self.audio_process_params.decode_mode != AUDIO_MODE_MONO_R: filterL = self.afeL.work(rf_data_resampled)
+            if self.audio_process_params.decode_mode != AUDIO_MODE_MONO_L: filterR = self.afeR.work(rf_data_resampled)
         if measure_perf:
             end_carrier_filter = perf_counter()
 
