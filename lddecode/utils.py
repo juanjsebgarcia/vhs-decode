@@ -236,11 +236,12 @@ def compute_level_adjusts(wowfactors, outwidth, wow_level_adjust_smoothing = 0, 
     # this indicates an hsync tbc error vs. being normal wow from playback speed variations
     # in this case for level adjusting we just want to fallback to the average wow to avoid a bright or dark line
     median = np.median(wowfactors)
-    mad = np.median(np.abs(wowfactors - median)) # median absolute deviation
+    deviation = np.abs(wowfactors - median)
+    mad = np.median(deviation) # median absolute deviation
     threshold = level_adjust_threshold * mad if mad > 0 else 0.001  # fallback for no variance
 
     level_adjusts = np.where(
-        np.abs(wowfactors - median) > threshold,
+        deviation > threshold,
         median,
         wowfactors
     )
@@ -546,6 +547,48 @@ def load_packed_data_4_40(infile, sample, readlen):
     return unpack_data_4_40(indata, readlen, offset)
 
 
+class RewindBuffer:
+    """The bytes most recently read from ffmpeg, kept for short backwards seeks.
+
+    Behaves like the bytearray it replaces for the operations LoadFFmpeg uses
+    (len, +=, slicing, deleting from the front), but lives in one fixed
+    allocation: deleting from the front only moves a start offset, and the kept
+    data is moved back to the front in place when the end is reached. A plain
+    bytearray reallocated (and copied into fresh pages) as it grew and shrank.
+    """
+
+    def __init__(self, capacity):
+        self.buf = bytearray(capacity)
+        self.start = 0
+        self.end = 0
+
+    def __len__(self):
+        return self.end - self.start
+
+    def __iadd__(self, data):
+        n = len(data)
+        if self.end + n > len(self.buf):
+            kept = self.end - self.start
+            if kept + n > len(self.buf):
+                self.buf.extend(bytes(kept + n - len(self.buf)))
+            with memoryview(self.buf) as view:
+                view[:kept] = view[self.start : self.end]
+            self.start, self.end = 0, kept
+        self.buf[self.end : self.end + n] = data
+        self.end += n
+        return self
+
+    def __getitem__(self, key):
+        start, stop, step = key.indices(len(self))
+        assert step == 1
+        return memoryview(self.buf)[self.start + start : self.start + max(start, stop)]
+
+    def __delitem__(self, key):
+        start, stop, step = key.indices(len(self))
+        assert start == 0 and step == 1
+        self.start += stop
+
+
 class LoadFFmpeg:
     """Load samples from a wide variety of formats using ffmpeg."""
 
@@ -564,7 +607,7 @@ class LoadFFmpeg:
         # small amounts. The last byte returned by ffmpeg is at the end of
         # this buffer.
         self.rewind_size = 16 * 1024 * 1024
-        self.rewind_buf = bytearray()
+        self.rewind_buf = RewindBuffer(2 * self.rewind_size + self.read_buffer_size)
 
     # ffmpeg can only run ahead of the decoder by as much as its output
     # channel buffers. A pipe holds just 64 KB (and can't be enlarged on

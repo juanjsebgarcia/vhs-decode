@@ -2095,7 +2095,8 @@ def process_chroma(
                 else field.rf.chroma_heterodyne
             )
 
-        uphet = np.zeros((linesout * outwidth), dtype=np.float32)
+        uphet = lddu.array_pool.take(linesout * outwidth, np.float32)
+        uphet.fill(0)
         upconvert_chroma(
             chroma,
             uphet,
