@@ -1,13 +1,22 @@
+mod bspline;
+mod bursts;
 mod filters;
 mod levels;
 mod ported;
 
 use numpy::ndarray::{Array1, ArrayView1, ArrayViewMut1, Zip};
-use numpy::{Complex64, IntoPyArray, PyArray1, PyReadonlyArray1, PyReadwriteArray1};
+use numpy::{
+    Complex64, IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadwriteArray1,
+    PyUntypedArrayMethods,
+};
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 
-use filters::{sos_filtfilt, sos_filtfilt_f32};
+use bspline::bspline_evaluate;
+use bursts::upconvert_filter_bursts_impl;
+use filters::{
+    f32_sos_from_scipy_dyn_slice, from_scipy_dyn_slice, sos_filtfilt, sos_filtfilt_f32,
+};
 use levels::fallback_vsync_loc_means_impl;
 use ported::unwrap_angles_impl;
 
@@ -197,6 +206,109 @@ fn sosfiltfilt_f32<'py>(
     output_array.into_pyarray(py)
 }
 
+/// Checks the burst bounds of upconvert_filter_bursts(_f32).
+fn check_burst_bounds(
+    chroma_len: usize,
+    heterodyne_lens: &[usize],
+    starts: &[usize],
+    ends: &[usize],
+) -> PyResult<()> {
+    if heterodyne_lens.len() != starts.len() || ends.len() != starts.len() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "heterodynes, starts and ends must have the same length",
+        ));
+    }
+    for (i, &heterodyne_len) in heterodyne_lens.iter().enumerate() {
+        let end = ends[i].max(starts[i]);
+        if end > chroma_len || end > heterodyne_len {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "burst bounds exceed the chroma or heterodyne length",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Up-convert (multiply with the heterodyne) and filter the color burst area of
+/// several lines in one call, see bursts::upconvert_filter_bursts_impl.
+/// Returns the filtered bursts (one zero padded row per line) and the number of
+/// valid samples in each row.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+fn upconvert_filter_bursts<'py>(
+    py: Python<'py>,
+    order: u32,
+    sos_filter: PyReadonlyArray1<'py, f64>,
+    chroma: PyReadonlyArray1<'py, f32>,
+    heterodynes: Vec<PyReadonlyArray1<'py, f64>>,
+    starts: Vec<usize>,
+    ends: Vec<usize>,
+    padding: usize,
+) -> PyResult<(Bound<'py, PyArray2<f64>>, Bound<'py, PyArray1<i64>>)> {
+    let lens: Vec<usize> = heterodynes.iter().map(|h| h.len()).collect();
+    check_burst_bounds(chroma.len(), &lens, &starts, &ends)?;
+    let sos = from_scipy_dyn_slice(order as usize, sos_filter.as_slice()?);
+    let chroma = chroma.as_array();
+    let heterodynes: Vec<_> = heterodynes.iter().map(|h| h.as_array()).collect();
+    let (bursts, lens) = py.detach(|| {
+        upconvert_filter_bursts_impl(&sos, chroma, &heterodynes, &starts, &ends, padding)
+    });
+    Ok((bursts.into_pyarray(py), lens.into_pyarray(py)))
+}
+
+/// Single precision version of upconvert_filter_bursts (f32 heterodynes, the product
+/// is filtered in f32 like sosfiltfilt_f32 does).
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+fn upconvert_filter_bursts_f32<'py>(
+    py: Python<'py>,
+    order: u32,
+    sos_filter: PyReadonlyArray1<'py, f64>,
+    chroma: PyReadonlyArray1<'py, f32>,
+    heterodynes: Vec<PyReadonlyArray1<'py, f32>>,
+    starts: Vec<usize>,
+    ends: Vec<usize>,
+    padding: usize,
+) -> PyResult<(Bound<'py, PyArray2<f32>>, Bound<'py, PyArray1<i64>>)> {
+    let lens: Vec<usize> = heterodynes.iter().map(|h| h.len()).collect();
+    check_burst_bounds(chroma.len(), &lens, &starts, &ends)?;
+    let sos = f32_sos_from_scipy_dyn_slice(order as usize, sos_filter.as_slice()?);
+    let chroma = chroma.as_array();
+    let heterodynes: Vec<_> = heterodynes.iter().map(|h| h.as_array()).collect();
+    let (bursts, lens) = py.detach(|| {
+        upconvert_filter_bursts_impl(&sos, chroma, &heterodynes, &starts, &ends, padding)
+    });
+    Ok((bursts.into_pyarray(py), lens.into_pyarray(py)))
+}
+
+/// Evaluate the nu-th derivative of the B-spline with knots t, coefficients c and degree k
+/// at x, like scipy.interpolate.BSpline(t, c, k, extrapolate)(x, nu) for 1-D c.
+/// fused selects whether the multiply-adds are fused, to match how scipy was compiled.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+fn bspline_eval<'py>(
+    py: Python<'py>,
+    t: PyReadonlyArray1<'py, f64>,
+    c: PyReadonlyArray1<'py, f64>,
+    k: usize,
+    x: PyReadonlyArray1<'py, f64>,
+    nu: usize,
+    extrapolate: bool,
+    fused: bool,
+) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    let t = t.as_slice()?;
+    let c = c.as_slice()?;
+    let x = x.as_slice()?;
+    if t.len() < 2 * k + 2 || c.len() < t.len() - k - 1 || nu > k {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "unsupported spline: need len(t) >= 2k + 2, len(c) >= len(t) - k - 1, nu <= k",
+        ));
+    }
+    let mut out = vec![0.0f64; x.len()];
+    py.detach(|| bspline_evaluate(t, c, k, x, nu, extrapolate, fused, &mut out));
+    Ok(out.into_pyarray(py))
+}
+
 #[pyfunction]
 fn check_debug<'py>(
     _py: Python<'py>,
@@ -220,6 +332,9 @@ fn vhsd_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(fallback_vsync_loc_means, m)?)?;
     m.add_function(wrap_pyfunction!(sosfiltfilt, m)?)?;
     m.add_function(wrap_pyfunction!(sosfiltfilt_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(upconvert_filter_bursts, m)?)?;
+    m.add_function(wrap_pyfunction!(upconvert_filter_bursts_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(bspline_eval, m)?)?;
     m.add_function(wrap_pyfunction!(check_debug, m)?)?;
     Ok(())
 }

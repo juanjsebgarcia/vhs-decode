@@ -229,6 +229,84 @@ sinc_phase_count = 2**16
 #     return table
 
 
+try:
+    from vhsd_rust import bspline_eval as _rust_bspline_eval
+except ImportError:
+    _rust_bspline_eval = None
+
+# Whether the Rust B-spline evaluation has to fuse multiply-adds to give the same results
+# as the installed scipy (depends on how scipy was compiled), or None if neither variant
+# matches (scipy is used then). Determined on first use by bspline_rust_mode().
+_bspline_rust_fused = "unknown"
+
+
+def bspline_rust_mode():
+    """Compare the Rust B-spline evaluation with scipy on a few test splines and return
+    the multiply-add mode (True: fused, False: not fused) that gives bit identical
+    results, or None if neither does (or the Rust module is not available)."""
+    global _bspline_rust_fused
+    if _bspline_rust_fused != "unknown":
+        return _bspline_rust_fused
+
+    _bspline_rust_fused = None
+    if _rust_bspline_eval is None:
+        return None
+
+    from scipy import interpolate
+
+    rng = np.random.default_rng(12345)
+    line_len = 2270.0
+    expected = np.arange(320) * line_len
+    actual = expected + 1000.3 + np.cumsum(rng.normal(0, 0.7, 320)) + rng.normal(0, 0.2, 320)
+    xs = np.concatenate([
+        np.arange(-3000.0, 0.0, 7.3),
+        np.arange(320 * 1135) * (line_len / 1135),
+        expected[-1] + np.arange(0.0, 5000.0, 9.1),
+        expected[::17],
+    ])
+    for fused in (True, False):
+        matches = True
+        for k, bc_type in ((1, None), (2, None), (3, "natural")):
+            spl = interpolate.make_interp_spline(expected, actual, k=k, bc_type=bc_type)
+            for nu in (0, 1):
+                ref = spl(xs, nu)
+                out = _rust_bspline_eval(spl.t, spl.c, spl.k, xs, nu, True, fused)
+                if ref.tobytes() != out.tobytes():
+                    matches = False
+        if matches:
+            _bspline_rust_fused = fused
+            break
+
+    return _bspline_rust_fused
+
+
+def eval_bspline(spl, x, nu=0):
+    """Same result as spl(x, nu) for a scipy BSpline with 1-D coefficients, evaluated
+    without holding the GIL when the Rust module reproduces scipy exactly."""
+    fused = bspline_rust_mode()
+    if (
+        fused is None
+        or spl.c.ndim != 1
+        or spl.extrapolate not in (True, False)
+        or spl.c.dtype != np.float64
+        or spl.t.dtype != np.float64
+        or nu > spl.k
+        or x.ndim != 1
+        or x.dtype != np.float64
+    ):
+        return spl(x, nu)
+
+    return _rust_bspline_eval(
+        np.ascontiguousarray(spl.t),
+        np.ascontiguousarray(spl.c),
+        int(spl.k),
+        np.ascontiguousarray(x),
+        int(nu),
+        bool(spl.extrapolate),
+        fused,
+    )
+
+
 @njit(nogil=True, cache=True, fastmath=True)
 def compute_level_adjusts(wowfactors, outwidth, wow_level_adjust_smoothing = 0, level_adjust_threshold = 15):
     """Per output sample amplitude correction used by scale_field, derived from the wow factors."""
