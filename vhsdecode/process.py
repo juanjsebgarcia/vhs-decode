@@ -50,6 +50,33 @@ from vhsdecode.rust_utils import sosfiltfilt_rust
 from vhsdecode.dbwriter import DBWriter
 
 
+_demod_thread_buffers = threading.local()
+
+
+class DemodBuffers:
+    """Per-thread scratch arrays for VHSRFDecode.demodblock"""
+
+    def __init__(self, blocklen):
+        half = blocklen // 2 + 1
+        self.blocklen = blocklen
+        self.complex_a = np.empty(blocklen, dtype=np.complex128)
+        self.complex_b = np.empty(blocklen, dtype=np.complex128)
+        self.complex_c = np.empty(blocklen, dtype=np.complex128)
+        self.half_complex_a = np.empty(half, dtype=np.complex128)
+        self.half_complex_b = np.empty(half, dtype=np.complex128)
+        self.single_a = np.empty(blocklen, dtype=np.float32)
+        self.single_b = np.empty(blocklen, dtype=np.float32)
+        self.double_a = np.empty(blocklen, dtype=np.float64)
+
+
+def _demod_buffers(blocklen):
+    buffers = getattr(_demod_thread_buffers, "buffers", None)
+    if buffers is None or buffers.blocklen != blocklen:
+        buffers = DemodBuffers(blocklen)
+        _demod_thread_buffers.buffers = buffers
+    return buffers
+
+
 def is_secam(system: str):
     return system == "SECAM" or system == "MESECAM"
 
@@ -1305,10 +1332,13 @@ class VHSRFDecode(ldd.RFDecode):
         rv = {}
         demod_block_debug = False
         demod_start_time = time.time()
+        # Scratch arrays for the intermediate steps, reused for every block this
+        # thread demodulates. Only arrays that are returned are freshly allocated.
+        buffers = _demod_buffers(self.blocklen)
         if fftdata is not None:
             indata_fft = fftdata
         elif data is not None:
-            indata_fft = npfft.fft(data[: self.blocklen])
+            indata_fft = npfft.fft(data[: self.blocklen], out=buffers.complex_a)
         else:
             raise Exception("demodblock called without raw or FFT data")
 
@@ -1327,14 +1357,19 @@ class VHSRFDecode(ldd.RFDecode):
         # Applies RF filters
         indata_fft *= self.Filters["RFVideo"]
 
-        raw_filtered = npfft.ifft(indata_fft * self.Filters["hilbert"]).real.astype(
-            np.single
-        )
+        # = npfft.ifft(indata_fft * self.Filters["hilbert"]).real.astype(np.single)
+        np.multiply(indata_fft, self.Filters["hilbert"], out=buffers.complex_b)
+        filtered_hilbert = npfft.ifft(buffers.complex_b, out=buffers.complex_c)
+        raw_filtered = buffers.single_a
+        np.copyto(raw_filtered, filtered_hilbert.real, casting="unsafe")
 
         # Calculate an evelope with signal strength using absolute of hilbert transform.
         # Roll this a bit to compensate for filter delay, value eyballed for now.
         np.abs(raw_filtered, out=raw_filtered)
-        raw_env = np.roll(raw_filtered, 4)
+        # = np.roll(raw_filtered, 4)
+        raw_env = buffers.single_b
+        raw_env[4:] = raw_filtered[:-4]
+        raw_env[:4] = raw_filtered[-4:]
         del raw_filtered
         # Downconvert to single precision for some possible speedup since we don't need
         # super high accuracy for the dropout detection.
@@ -1356,7 +1391,8 @@ class VHSRFDecode(ldd.RFDecode):
         else:
             ldd.logger.warning("RF signal is weak. Is your deck tracking properly?")
 
-        hilbert = npfft.ifft(indata_fft * self.Filters["hilbert"])
+        np.multiply(indata_fft, self.Filters["hilbert"], out=buffers.complex_b)
+        hilbert = npfft.ifft(buffers.complex_b, out=buffers.complex_c)
 
         if not demod_block_debug:
             del indata_fft
@@ -1399,8 +1435,10 @@ class VHSRFDecode(ldd.RFDecode):
             demod = self.chromaTrap.work(demod)
 
         # applies main deemphasis filter
-        demod_fft = npfft.rfft(demod)
-        out_video_fft = demod_fft * self.Filters["FVideo"]
+        demod_fft = npfft.rfft(demod, out=buffers.half_complex_a)
+        out_video_fft = np.multiply(
+            demod_fft, self.Filters["FVideo"], out=buffers.half_complex_b
+        )
         out_video = npfft.irfft(out_video_fft).real
 
         if self.options.nldeemp:
@@ -1438,7 +1476,8 @@ class VHSRFDecode(ldd.RFDecode):
                 self.Filters["fsc_notch"][0], self.Filters["fsc_notch"][1], out_video
             )
 
-        out_video05 = npfft.irfft(demod_fft * self.Filters["FVideo05"]).real
+        np.multiply(demod_fft, self.Filters["FVideo05"], out=buffers.half_complex_b)
+        out_video05 = npfft.irfft(buffers.half_complex_b, out=buffers.double_a)
         out_video05 = np.roll(out_video05, -self.Filters["F05_offset"])
 
         # Filter out the color-under signal from the raw data.
@@ -1490,9 +1529,18 @@ class VHSRFDecode(ldd.RFDecode):
             out_video = demod
 
         # demod_burst is a bit misleading, but keeping the naming for compatability.
-        video_out = np.rec.array(
-            [out_video, out_video05, out_chroma, env],
-            names=["demod", "demod_05", "demod_burst", "envelope"],
+        # Kept as separate contiguous arrays rather than a packed record array,
+        # see DemodColumns.
+        # demod_burst is only ever read through Field.downscale, which converts
+        # it to float32 first, so it is stored as float32 here (same values,
+        # converting before joining the blocks gives the same result).
+        video_out = lddu.DemodColumns(
+            {
+                "demod": out_video,
+                "demod_05": out_video05,
+                "demod_burst": out_chroma.astype(np.float32),
+                "envelope": env,
+            }
         )
 
         rv["video"] = (

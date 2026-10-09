@@ -952,7 +952,8 @@ def refine_linelocs_hsync(field, stdint.uint8_t[::1] linebad, double hsync_thres
     cdef double[::1] linelocs_refined = np.array(linelocs_original, dtype=np.float64, copy=True)
 
     # Lookup these values here instead of doing it on every loop iteration.
-    cdef double[::1] demod_05 = np.array(field.data["video"]["demod_05"], dtype=np.float64, order='c')
+    # Only read here, so no copy is needed when it is already contiguous float64.
+    cdef double[::1] demod_05 = np.ascontiguousarray(field.data["video"]["demod_05"], dtype=np.float64)
     rf = field.rf
     cdef int normal_hsync_length = field.usectoinpx(rf.SysParams["hsyncPulseUS"])
     cdef int one_usec = rf.freq

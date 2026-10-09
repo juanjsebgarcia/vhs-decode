@@ -36,4 +36,4 @@ def sosfiltfilt_rust(sos, input):
         return sosfiltfilt(order, filter, input)
     # if input.dtype == np.float32:
     #    return sosfiltfilt_f32(order, filter, input)
-    return sosfiltfilt_f32(order, filter, input.astype(np.float32))
+    return sosfiltfilt_f32(order, filter, np.ascontiguousarray(input, dtype=np.float32))

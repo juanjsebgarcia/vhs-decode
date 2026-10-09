@@ -1263,7 +1263,10 @@ class FieldShared:
             # try to detect the levels by measuring the lower 5%, and 25% of data
             n = len(filtered_demod)
             idx_5, idx_25 = int(n * 0.05), int(n * 0.25)
-            partitioned = np.partition(filtered_demod, (idx_5, idx_25))
+            # Same as np.partition (a copy partitioned in place), in a recycled buffer
+            partitioned = lddu.array_pool.take(n, filtered_demod.dtype)
+            partitioned[:] = filtered_demod
+            partitioned.partition((idx_5, idx_25))
             sync_tip_est, blanking_est = partitioned[idx_5], partitioned[idx_25]
 
             pulses, sync_tip_level, blanking_level = FieldShared._get_pulses(
